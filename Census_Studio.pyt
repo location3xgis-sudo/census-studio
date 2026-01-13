@@ -194,6 +194,7 @@ class DownloadACSDataR(object):
             multiValue=True)
         p9.filter.type = "ValueList"
         p9.filter.list = []
+        p9.parameterDependencies = [p8.name]  # Refresh when state changes
         p9.description = "Select one or more counties. Available when a single state is selected. The FIPS code is shown in parentheses."
 
         p10 = arcpy.Parameter(
@@ -344,31 +345,34 @@ class DownloadACSDataR(object):
             state_param.enabled = True
             zcta_param.enabled = False
 
-            # Populate county dropdown based on selected state(s)
-            if len(state_values) >= 1:
-                county_param.enabled = True
-                county_lookup = self._load_county_lookup()
-                if county_lookup:
-                    all_counties = []
-                    for state in state_values:
-                        if state in county_lookup:
-                            counties = county_lookup[state]
-                            if len(state_values) == 1:
-                                # Single state: no prefix needed
-                                all_counties.extend([f"{c['name']} ({c['fips']})" for c in counties])
-                            else:
-                                # Multiple states: prefix with state abbreviation
-                                all_counties.extend([f"{state} - {c['name']} ({c['fips']})" for c in counties])
-                    county_param.filter.list = all_counties if all_counties else ["(No counties available)"]
+            # Populate county dropdown when state selection changes
+            if state_param.altered and not state_param.hasBeenValidated:
+                county_param.value = None  # Clear previous selection
+                if len(state_values) >= 1:
+                    county_param.enabled = True
+                    county_lookup = self._load_county_lookup()
+                    if county_lookup:
+                        all_counties = []
+                        for state in state_values:
+                            if state in county_lookup:
+                                counties = county_lookup[state]
+                                if len(state_values) == 1:
+                                    # Single state: no prefix needed
+                                    all_counties.extend([f"{c['name']} ({c['fips']})" for c in counties])
+                                else:
+                                    # Multiple states: prefix with state abbreviation
+                                    all_counties.extend([f"{state} - {c['name']} ({c['fips']})" for c in counties])
+                        county_param.filter.list = all_counties if all_counties else ["(No counties available)"]
+                    else:
+                        county_param.filter.list = ["(No counties available)"]
                 else:
-                    county_param.filter.list = ["(No counties available)"]
-                # Clear county selection when state changes
-                if state_param.altered and not state_param.hasBeenValidated:
-                    county_param.value = None
+                    # No state selected
+                    county_param.enabled = False
+                    county_param.filter.list = ["(Select a state first)"]
+            elif len(state_values) >= 1:
+                county_param.enabled = True
             else:
-                # No state selected
                 county_param.enabled = False
-                county_param.filter.list = ["(Select a state first)"]
 
             # Clear ZCTA value to prevent stale data being passed to R
             if geo_level_param.altered and not geo_level_param.hasBeenValidated:
