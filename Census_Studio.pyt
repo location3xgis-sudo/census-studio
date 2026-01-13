@@ -47,6 +47,17 @@ class DownloadACSDataR(object):
             pass
         return None
 
+    def _load_county_lookup(self):
+        """Load the US counties lookup file."""
+        county_file = os.path.join(os.path.dirname(__file__), "lookups", "us_counties.json")
+        try:
+            if os.path.exists(county_file):
+                with open(county_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return None
+
     def _find_rscript(self):
         for base_path in [r"C:\Program Files\R", r"C:\Program Files (x86)\R"]:
             if os.path.exists(base_path):
@@ -171,16 +182,19 @@ class DownloadACSDataR(object):
             "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "PR",
             "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
             "WI", "WY"]
-        p8.description = "Select one or more states. County filtering is disabled when multiple states are selected."
+        p8.description = "Select one or more states. When multiple states are selected, county names will be prefixed with the state abbreviation."
 
         p9 = arcpy.Parameter(
-            displayName="County (optional - comma separated for multiple counties)",
+            displayName="County (optional)",
             name="county",
             datatype="GPString",
             parameterType="Optional",
             direction="Input",
-            category="Geography")
-        p9.description = "Filter to specific counties (comma-separated for multiple, e.g., 'Travis, Williamson, Hays'). Enter county names without 'County' suffix. Leave blank for all counties in the state."
+            category="Geography",
+            multiValue=True)
+        p9.filter.type = "ValueList"
+        p9.filter.list = []
+        p9.description = "Select one or more counties. Available when a single state is selected. The FIPS code is shown in parentheses."
 
         p10 = arcpy.Parameter(
             displayName="ZCTA (comma separated for multiple ZCTAs)",
@@ -210,7 +224,7 @@ class DownloadACSDataR(object):
             parameterType="Required",
             direction="Output",
             category="Geography")
-        p12.description = "Output location for the feature class. Use a geodatabase for full field names, or shapefile (10-character field name limit)."
+        p12.description = "Output location for the feature class. Must be in a file geodatabase (.gdb) or enterprise geodatabase (.sde)."
 
         p13 = arcpy.Parameter(
             displayName="Keep Geographic Variables",
@@ -234,6 +248,8 @@ class DownloadACSDataR(object):
         cat_param = parameters[2]
         tbl_param = parameters[3]
         var_param = parameters[4]
+        manual_var_param = parameters[5]
+        download_table_param = parameters[6]
         geo_level_param = parameters[7]
         state_param = parameters[8]
         county_param = parameters[9]
@@ -245,6 +261,29 @@ class DownloadACSDataR(object):
 
         # Load lookup based on year/survey
         lookup = self._load_lookup(year, survey)
+
+        # --- Mutual Exclusion: Variables vs Download Entire Table ---
+        # Disable "Download Entire Table" if variables are selected or entered manually
+        has_selected_vars = var_param.values and len(var_param.values) > 0
+        has_manual_vars = manual_var_param.valueAsText and len(manual_var_param.valueAsText.strip()) > 0
+        if has_selected_vars or has_manual_vars:
+            download_table_param.enabled = False
+            download_table_param.value = False
+        else:
+            download_table_param.enabled = True
+
+        # Disable variable selection if "Download Entire Table" is checked
+        if download_table_param.value:
+            var_param.enabled = False
+            manual_var_param.enabled = False
+            # Clear any selected variables
+            if var_param.values:
+                var_param.value = None
+            if manual_var_param.valueAsText:
+                manual_var_param.value = None
+        else:
+            var_param.enabled = True
+            manual_var_param.enabled = True
 
         # --- Variable Browser Logic ---
         # Refresh categories when year or survey changes
@@ -305,13 +344,31 @@ class DownloadACSDataR(object):
             state_param.enabled = True
             zcta_param.enabled = False
 
-            # Disable county if multiple states selected
-            if multiple_states:
-                county_param.enabled = False
+            # Populate county dropdown based on selected state(s)
+            if len(state_values) >= 1:
+                county_param.enabled = True
+                county_lookup = self._load_county_lookup()
+                if county_lookup:
+                    all_counties = []
+                    for state in state_values:
+                        if state in county_lookup:
+                            counties = county_lookup[state]
+                            if len(state_values) == 1:
+                                # Single state: no prefix needed
+                                all_counties.extend([f"{c['name']} ({c['fips']})" for c in counties])
+                            else:
+                                # Multiple states: prefix with state abbreviation
+                                all_counties.extend([f"{state} - {c['name']} ({c['fips']})" for c in counties])
+                    county_param.filter.list = all_counties if all_counties else ["(No counties available)"]
+                else:
+                    county_param.filter.list = ["(No counties available)"]
+                # Clear county selection when state changes
                 if state_param.altered and not state_param.hasBeenValidated:
                     county_param.value = None
             else:
-                county_param.enabled = True
+                # No state selected
+                county_param.enabled = False
+                county_param.filter.list = ["(Select a state first)"]
 
             # Clear ZCTA value to prevent stale data being passed to R
             if geo_level_param.altered and not geo_level_param.hasBeenValidated:
@@ -368,8 +425,13 @@ class DownloadACSDataR(object):
                 state_param.setErrorMessage("State is required for this geography level")
             if zcta_param.value:
                 zcta_param.setWarningMessage("ZCTA is ignored for non-ZCTA geography levels")
-            if multiple_states and county_param.value:
-                county_param.setWarningMessage("County filtering disabled when multiple states selected")
+
+        # --- Output Validation ---
+        output_param = parameters[12]
+        output_path = output_param.valueAsText
+        if output_path:
+            if '.gdb' not in output_path.lower() and '.sde' not in output_path.lower():
+                output_param.setErrorMessage("Output must be in a geodatabase (.gdb or .sde). Shapefiles are not supported.")
 
     def execute(self, parameters, messages):
         script_path = os.path.join(os.path.dirname(__file__), "acs_download.R")
@@ -406,12 +468,29 @@ class DownloadACSDataR(object):
         else:
             state_str = ""
 
+        # Handle multi-value county parameter - extract FIPS codes
+        county_values = parameters[9].values or []
+        if county_values:
+            # Extract FIPS code from "County Name (FIPS)" format
+            county_fips = []
+            for cv in county_values:
+                if "(" in cv and ")" in cv:
+                    # Extract FIPS from parentheses
+                    fips = cv.split("(")[-1].rstrip(")")
+                    county_fips.append(fips)
+                else:
+                    # Fallback: use the value as-is (for backwards compatibility)
+                    county_fips.append(str(cv))
+            county_str = ",".join(county_fips)
+        else:
+            county_str = ""
+
         in_params = [
             to_r_str(parameters[7].valueAsText),   # geography
             vars_str,                               # variables
             tbl_code,                               # table code
             state_str,                              # state (comma-separated)
-            to_r_str(parameters[9].valueAsText),   # county
+            county_str,                             # county FIPS codes (comma-separated)
             to_r_str(parameters[10].valueAsText),  # zcta
             to_r_str(parameters[0].value),         # year
             to_r_str(parameters[1].valueAsText),   # survey
@@ -433,27 +512,22 @@ class DownloadACSDataR(object):
             arcpy.AddMessage(f"  Variables: {vars_str or '(none specified)'}")
         arcpy.AddMessage(f"  Geography: {in_params[0]}")
         arcpy.AddMessage(f"  State: {in_params[3]}")
-        arcpy.AddMessage(f"  County: {in_params[4] or '(all)'}")
+        # Display county selections (show names if available)
+        if county_values:
+            county_display = ", ".join([str(cv) for cv in county_values])
+            arcpy.AddMessage(f"  County: {county_display}")
+        else:
+            arcpy.AddMessage(f"  County: (all)")
         arcpy.AddMessage(f"  Output: {parameters[12].valueAsText}")
         arcpy.AddMessage("=" * 50)
 
-        # Check if output is a geodatabase feature class
+        # Output to geodatabase via GeoPackage intermediate (supports long field names)
         output_path = parameters[12].valueAsText
-        self._temp_shp = None
-        truncate_fields = "TRUE"  # Default: truncate for shapefiles
-
-        if '.gdb' in output_path.lower() or '.sde' in output_path.lower():
-            # Output is geodatabase - use GeoPackage as intermediate (supports long field names)
-            temp_dir = tempfile.mkdtemp(prefix="acs_download_")
-            fc_name = os.path.basename(output_path)
-            self._temp_gpkg = os.path.join(temp_dir, f"{fc_name}.gpkg")
-            truncate_fields = "FALSE"  # Don't truncate - geodatabase supports long names
-            arcpy.AddMessage(f"Geodatabase output detected.")
-            arcpy.AddMessage(f"Writing to temporary GeoPackage first: {self._temp_gpkg}")
-            out_params = [self._temp_gpkg, truncate_fields]
-        else:
-            self._temp_gpkg = None
-            out_params = [output_path, truncate_fields]
+        temp_dir = tempfile.mkdtemp(prefix="acs_download_")
+        fc_name = os.path.basename(output_path)
+        self._temp_gpkg = os.path.join(temp_dir, f"{fc_name}.gpkg")
+        arcpy.AddMessage(f"Writing to temporary GeoPackage first: {self._temp_gpkg}")
+        out_params = [self._temp_gpkg, "FALSE"]  # FALSE = don't truncate field names
 
         rscript = self._find_rscript()
         if not rscript:
@@ -505,8 +579,8 @@ class DownloadACSDataR(object):
         except Exception as e:
             arcpy.AddError(f"Error running R script: {str(e)}")
 
-        # If R succeeded and we need to convert to geodatabase, do it now
-        if r_success and hasattr(self, '_temp_gpkg') and self._temp_gpkg:
+        # If R succeeded, convert temp GeoPackage to geodatabase
+        if r_success:
             try:
                 final_output = parameters[12].valueAsText
                 arcpy.AddMessage(f"Converting to geodatabase feature class...")
@@ -546,12 +620,8 @@ class DownloadACSDataR(object):
                 except Exception as cleanup_error:
                     arcpy.AddWarning(f"Could not clean up temp files: {cleanup_error}")
 
-        elif r_success:
-            # Direct output (shapefile), no conversion needed
-            arcpy.AddMessage("Download completed successfully!")
-
         # If R failed, still try to clean up any temp files
-        if not r_success and hasattr(self, '_temp_gpkg') and self._temp_gpkg:
+        if not r_success:
             try:
                 temp_dir = os.path.dirname(self._temp_gpkg)
                 if os.path.exists(temp_dir) and temp_dir.startswith(tempfile.gettempdir()):
@@ -2213,15 +2283,7 @@ class GenerateVariableLookup(object):
         p1.filter.list = ["acs5", "acs1"]
         p1.value = "acs5"
 
-        p2 = arcpy.Parameter(
-            displayName="Output JSON File (optional)",
-            name="output_file",
-            datatype="DEFile",
-            parameterType="Optional",
-            direction="Output")
-        p2.filter.list = ["json"]
-
-        return [p0, p1, p2]
+        return [p0, p1]
 
     def isLicensed(self):
         return True
@@ -2240,15 +2302,13 @@ class GenerateVariableLookup(object):
 
         year = parameters[0].value
         survey = parameters[1].valueAsText
-        output_file = parameters[2].valueAsText
-        if not output_file:
-            lookups_dir = os.path.join(os.path.dirname(__file__), "lookups")
-            if not os.path.exists(lookups_dir):
-                os.makedirs(lookups_dir)
-            output_file = os.path.join(
-                lookups_dir, 
-                f"acs_variable_lookup_{year}_{survey}.json"
-            )
+        lookups_dir = os.path.join(os.path.dirname(__file__), "lookups")
+        if not os.path.exists(lookups_dir):
+            os.makedirs(lookups_dir)
+        output_file = os.path.join(
+            lookups_dir,
+            f"acs_variable_lookup_{year}_{survey}.json"
+        )
 
         arcpy.AddMessage("=" * 50)
         arcpy.AddMessage("Generating ACS Variable Lookup")

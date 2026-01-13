@@ -38,7 +38,7 @@ clean_field_name <- function(label, var_code) {
 
 clean_field_names <- function(data, year, survey) {
   tryCatch({
-    var_info <- tidycensus::load_variables(year = year, dataset = survey)
+    var_info <- suppressMessages(tidycensus::load_variables(year = year, dataset = survey))
     estimate_cols <- grep("E$", names(data), value = TRUE)
     var_codes <- unique(gsub("E$", "", estimate_cols))
     name_map <- list()
@@ -157,9 +157,11 @@ cat(paste("Output file:", output_fc, "\n"))
 cat(paste("Truncate fields:", truncate_fields, "\n"))
 
 cat("Loading required R packages...\n")
-library(tidycensus)
-library(sf)
-library(dplyr)
+suppressPackageStartupMessages({
+  library(tidycensus)
+  library(sf)
+  library(dplyr)
+})
 
 if (Sys.getenv("CENSUS_API_KEY") == "") {
   stop("Census API key not found. Run 'Set Census API Key' tool first.")
@@ -218,7 +220,7 @@ if (!is_empty(summary_var)) { acs_params$summary_var <- summary_var }
 
 cat("Calling Census API...\n")
 acs_data <- tryCatch({
-  do.call(get_acs, acs_params)
+  suppressMessages(do.call(get_acs, acs_params))
 }, error = function(e) {
   err_msg <- e$message
   
@@ -247,7 +249,15 @@ acs_data <- tryCatch({
                 "The Census Bureau may not have boundary files available for this year/geography combination. ",
                 "Try an earlier year or check https://www2.census.gov/geo/tiger/ for availability."))
   }
-  
+
+  # Check for index errors that may indicate county name matching issues
+  if (grepl("index", err_msg, ignore.case = TRUE) && !is.null(county)) {
+    stop(paste0("Error calling Census API: ", err_msg, "\n\n",
+                "This may be caused by an ambiguous county name (e.g., 'Yellowstone' conflicts with the national park). ",
+                "Try using the 3-digit county FIPS code instead of the county name. ",
+                "You can find FIPS codes at: https://www.census.gov/library/reference/code-lists/ansi.html"))
+  }
+
   # Default: pass through original error
   stop(paste("Error calling Census API:", err_msg))
 })
@@ -272,7 +282,17 @@ if (output_format == "shapefile" && truncate_fields) {
 cat("Writing output...\n")
 if (include_geometry) {
   if (output_format == "geopackage") {
-    sf::st_write(acs_data, output_fc, delete_dsn = TRUE, quiet = TRUE)
+    # Write with explicit layer name to avoid field name issues
+    layer_name <- tools::file_path_sans_ext(basename(output_fc))
+    sf::st_write(acs_data, output_fc, layer = layer_name, delete_dsn = TRUE, quiet = TRUE)
+
+    # Verify NAME field wasn't truncated (GDAL/GeoPackage bug workaround)
+    written_data <- sf::st_read(output_fc, quiet = TRUE)
+    if ("NAM" %in% names(written_data) && !"NAME" %in% names(written_data)) {
+      cat("Fixing truncated NAME field...\n")
+      names(written_data)[names(written_data) == "NAM"] <- "NAME"
+      sf::st_write(written_data, output_fc, layer = layer_name, delete_dsn = TRUE, quiet = TRUE)
+    }
   } else {
     sf::st_write(acs_data, output_fc, delete_layer = TRUE, quiet = TRUE)
   }

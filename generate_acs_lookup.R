@@ -96,7 +96,8 @@ generate_lookup <- function(year, survey, output_file) {
     mutate(
       table_code = gsub("_.*$", "", name),
       label_clean = gsub("^Estimate!!", "", label),
-      label_clean = gsub("^Annotation of ", "", label_clean)
+      label_clean = gsub("^Annotation of ", "", label_clean),
+      label_clean = gsub("!!", " | ", label_clean)
     )
   
   # Get unique tables with their concepts (table descriptions)
