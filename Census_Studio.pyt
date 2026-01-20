@@ -47,17 +47,6 @@ class DownloadACSDataR(object):
             pass
         return None
 
-    def _load_county_lookup(self):
-        """Load the US counties lookup file."""
-        county_file = os.path.join(os.path.dirname(__file__), "lookups", "us_counties.json")
-        try:
-            if os.path.exists(county_file):
-                with open(county_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return None
-
     def _find_rscript(self):
         for base_path in [r"C:\Program Files\R", r"C:\Program Files (x86)\R"]:
             if os.path.exists(base_path):
@@ -185,17 +174,13 @@ class DownloadACSDataR(object):
         p8.description = "Select one or more states. When multiple states are selected, county names will be prefixed with the state abbreviation."
 
         p9 = arcpy.Parameter(
-            displayName="County (optional)",
+            displayName="County FIPS Codes (optional, comma-separated)",
             name="county",
             datatype="GPString",
             parameterType="Optional",
             direction="Input",
-            category="Geography",
-            multiValue=True)
-        p9.filter.type = "ValueList"
-        p9.filter.list = []
-        p9.parameterDependencies = [p8.name]  # Refresh when state changes
-        p9.description = "Select one or more counties. Available when a single state is selected. The FIPS code is shown in parentheses."
+            category="Geography")
+        p9.description = "Enter county FIPS codes (comma-separated, e.g., '029, 037, 071'). Leave blank for all counties in selected state(s). Find codes at: https://www.census.gov/library/reference/code-lists/ansi.html"
 
         p10 = arcpy.Parameter(
             displayName="ZCTA (comma separated for multiple ZCTAs)",
@@ -345,34 +330,8 @@ class DownloadACSDataR(object):
             state_param.enabled = True
             zcta_param.enabled = False
 
-            # Populate county dropdown when state selection changes
-            if state_param.altered and not state_param.hasBeenValidated:
-                county_param.value = None  # Clear previous selection
-                if len(state_values) >= 1:
-                    county_param.enabled = True
-                    county_lookup = self._load_county_lookup()
-                    if county_lookup:
-                        all_counties = []
-                        for state in state_values:
-                            if state in county_lookup:
-                                counties = county_lookup[state]
-                                if len(state_values) == 1:
-                                    # Single state: no prefix needed
-                                    all_counties.extend([f"{c['name']} ({c['fips']})" for c in counties])
-                                else:
-                                    # Multiple states: prefix with state abbreviation
-                                    all_counties.extend([f"{state} - {c['name']} ({c['fips']})" for c in counties])
-                        county_param.filter.list = all_counties if all_counties else ["(No counties available)"]
-                    else:
-                        county_param.filter.list = ["(No counties available)"]
-                else:
-                    # No state selected
-                    county_param.enabled = False
-                    county_param.filter.list = ["(Select a state first)"]
-            elif len(state_values) >= 1:
-                county_param.enabled = True
-            else:
-                county_param.enabled = False
+            # County is always enabled for manual FIPS entry
+            county_param.enabled = True
 
             # Clear ZCTA value to prevent stale data being passed to R
             if geo_level_param.altered and not geo_level_param.hasBeenValidated:
@@ -472,22 +431,11 @@ class DownloadACSDataR(object):
         else:
             state_str = ""
 
-        # Handle multi-value county parameter - extract FIPS codes
-        county_values = parameters[9].values or []
-        if county_values:
-            # Extract FIPS code from "County Name (FIPS)" format
-            county_fips = []
-            for cv in county_values:
-                if "(" in cv and ")" in cv:
-                    # Extract FIPS from parentheses
-                    fips = cv.split("(")[-1].rstrip(")")
-                    county_fips.append(fips)
-                else:
-                    # Fallback: use the value as-is (for backwards compatibility)
-                    county_fips.append(str(cv))
-            county_str = ",".join(county_fips)
-        else:
-            county_str = ""
+        # Handle county parameter - comma-separated FIPS codes
+        county_str = parameters[9].valueAsText or ""
+        if county_str:
+            # Clean up: remove spaces around commas
+            county_str = ",".join([c.strip() for c in county_str.split(",") if c.strip()])
 
         in_params = [
             to_r_str(parameters[7].valueAsText),   # geography
@@ -516,12 +464,7 @@ class DownloadACSDataR(object):
             arcpy.AddMessage(f"  Variables: {vars_str or '(none specified)'}")
         arcpy.AddMessage(f"  Geography: {in_params[0]}")
         arcpy.AddMessage(f"  State: {in_params[3]}")
-        # Display county selections (show names if available)
-        if county_values:
-            county_display = ", ".join([str(cv) for cv in county_values])
-            arcpy.AddMessage(f"  County: {county_display}")
-        else:
-            arcpy.AddMessage(f"  County: (all)")
+        arcpy.AddMessage(f"  County: {county_str or '(all)'}")
         arcpy.AddMessage(f"  Output: {parameters[12].valueAsText}")
         arcpy.AddMessage("=" * 50)
 
@@ -676,11 +619,12 @@ class JoinACSData(object):
         p0 = arcpy.Parameter(
             displayName="Input Feature Class",
             name="input_fc",
-            datatype="DEFeatureClass",
+            datatype="GPFeatureLayer",
             parameterType="Required",
             direction="Input",
             category="Input")
-        p0.description = "The polygon feature class to join Census data to."
+        p0.filter.list = ["Polygon"]
+        p0.description = "The polygon feature class to join Census data to. Select from the active map or browse to a feature class."
 
         p1 = arcpy.Parameter(
             displayName="Year",
@@ -774,45 +718,27 @@ class JoinACSData(object):
         p8.description = "The Census geography level to use as source data. Smaller geographies give more precise results."
 
         p9 = arcpy.Parameter(
-            displayName="State",
-            name="state",
-            datatype="GPString",
-            parameterType="Required",
-            direction="Input",
-            category="Census Data",
-            multiValue=True)
-        p9.filter.type = "ValueList"
-        p9.filter.list = [
-            "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL",
-            "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME",
-            "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH",
-            "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "PR",
-            "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
-            "WI", "WY"]
-        p9.description = "Select the state(s) that cover your input features."
-
-        p10 = arcpy.Parameter(
             displayName="Join Method",
             name="join_method",
             datatype="GPString",
             parameterType="Required",
             direction="Input",
             category="Join Options")
-        p10.filter.type = "ValueList"
-        p10.filter.list = ["Area Weighted", "Population Weighted"]
-        p10.value = "Area Weighted"
-        p10.description = "Area weighted uses geometric overlap. Population weighted is more accurate but slower."
+        p9.filter.type = "ValueList"
+        p9.filter.list = ["Area Weighted", "Population Weighted"]
+        p9.value = "Area Weighted"
+        p9.description = "Area weighted uses geometric overlap. Population weighted is more accurate but slower."
 
-        p11 = arcpy.Parameter(
+        p10 = arcpy.Parameter(
             displayName="Output Feature Class",
             name="output_fc",
             datatype="DEFeatureClass",
             parameterType="Required",
             direction="Output",
             category="Output")
-        p11.description = "Output feature class with Census data joined."
+        p10.description = "Output feature class with Census data joined."
 
-        return [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11]
+        return [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10]
 
     def isLicensed(self):
         return True
@@ -871,7 +797,6 @@ class JoinACSData(object):
         survey_param = parameters[2]
         var_param = parameters[5]
         manual_var_param = parameters[6]
-        state_param = parameters[9]
 
         year = year_param.value
         survey = survey_param.valueAsText
@@ -891,10 +816,6 @@ class JoinACSData(object):
             if not manual_var_param.value:
                 parameters[3].setErrorMessage(
                     f"No variable lookup file for {year} {survey}. Run 'Generate Variable Lookup File' or enter codes manually.")
-
-        # Check state selection
-        if not state_param.value:
-            state_param.setErrorMessage("Select at least one state that covers your input features")
 
     def execute(self, parameters, messages):
         
@@ -922,13 +843,10 @@ class JoinACSData(object):
 
         geography = parameters[8].valueAsText
 
-        state_values = parameters[9].values or []
-        state_str = ",".join([str(s) for s in state_values])
-
-        join_method_full = parameters[10].valueAsText
+        join_method_full = parameters[9].valueAsText
         join_method = "area" if "Area" in join_method_full else "population"
 
-        output_path = parameters[11].valueAsText
+        output_path = parameters[10].valueAsText
 
         arcpy.AddMessage("=" * 60)
         arcpy.AddMessage("Join ACS Data Parameters:")
@@ -937,7 +855,7 @@ class JoinACSData(object):
         arcpy.AddMessage(f"  Variables: {vars_str}")
         arcpy.AddMessage(f"  Variable Type: {var_type}")
         arcpy.AddMessage(f"  Census Geography: {geography}")
-        arcpy.AddMessage(f"  State(s): {state_str}")
+        arcpy.AddMessage(f"  State/County: (auto-detected from input features)")
         arcpy.AddMessage(f"  Join Method: {join_method}")
         arcpy.AddMessage(f"  Output: {output_path}")
         arcpy.AddMessage("=" * 60)
@@ -1007,12 +925,16 @@ class JoinACSData(object):
         temp_input_r = temp_input_fc.replace("\\", "/")
         out_file_r = out_file.replace("\\", "/")
 
+        # Get path to cache directory for county boundaries
+        cache_dir = os.path.join(os.path.dirname(__file__), "cache")
+        cache_dir_r = cache_dir.replace("\\", "/")
+
         cmd = [
             rscript, script_path,
             temp_input_r,
             str(year), survey, vars_str, var_type,
-            geography, state_str, join_method,
-            out_file_r, truncate_fields
+            geography, join_method,
+            out_file_r, truncate_fields, cache_dir_r
         ]
 
         arcpy.AddMessage(f"Input path for R: {temp_input_r}")

@@ -4,6 +4,23 @@
 # Supports area-weighted and population-weighted spatial joins
 # =============================================================================
 
+# Suppress all warnings and messages at the very start (before loading packages)
+options(
+  warn = -1,
+  tigris_use_cache = TRUE,
+  tigris_progress_bar = FALSE,
+  readr.show_progress = FALSE
+)
+
+# Suppress sf messages by redirecting message output to null
+invisible(suppressMessages(suppressWarnings({
+  if (.Platform$OS.type == "windows") {
+    sink(file("NUL", open = "wt"), type = "message")
+  } else {
+    sink(file("/dev/null", open = "wt"), type = "message")
+  }
+})))
+
 # --- Helper Functions ---
 
 is_empty <- function(x) {
@@ -111,21 +128,212 @@ truncate_shapefile_fields <- function(data) {
   return(data)
 }
 
+clean_field_name <- function(label, var_code) {
+  label <- gsub("^Estimate!!", "", label)
+  label <- gsub("^Annotation of ", "", label)
+  replacements <- c(
+    "Median household income in the past 12 months \\(in \\d{4} inflation-adjusted dollars\\)" = "Median_HH_Income",
+    "Per capita income in the past 12 months \\(in \\d{4} inflation-adjusted dollars\\)" = "Per_Capita_Income",
+    "Total population" = "Total_Pop",
+    " in the past 12 months" = "",
+    "\\(in \\d{4} inflation-adjusted dollars\\)" = ""
+  )
+  for (pattern in names(replacements)) {
+    label <- gsub(pattern, replacements[pattern], label, perl = TRUE)
+  }
+  label <- gsub("[!:/-]", "_", label)
+  label <- gsub("[\\(\\),']", "", label)
+  label <- gsub(" ", "_", label)
+  label <- gsub("_{2,}", "_", label)
+  label <- gsub("^_+|_+$", "", label)
+  if (nchar(label) == 0) return(var_code)
+  if (nchar(label) > 64) label <- substr(label, 1, 64)
+  return(label)
+}
+
+clean_field_names <- function(data, year, survey) {
+  tryCatch({
+    var_info <- suppressMessages(tidycensus::load_variables(year = year, dataset = survey))
+    estimate_cols <- grep("E$", names(data), value = TRUE)
+    var_codes <- unique(gsub("E$", "", estimate_cols))
+    name_map <- list()
+    for (var_code in var_codes) {
+      match_idx <- which(var_info$name == var_code)
+      if (length(match_idx) > 0) {
+        label <- var_info$label[match_idx[1]]
+        name_map[[var_code]] <- clean_field_name(label, var_code)
+      } else {
+        name_map[[var_code]] <- var_code
+      }
+    }
+    new_names <- names(data)
+    for (i in seq_along(new_names)) {
+      col <- new_names[i]
+      if (grepl("E$", col)) {
+        var_code <- gsub("E$", "", col)
+        if (var_code %in% names(name_map)) new_names[i] <- name_map[[var_code]]
+      } else if (grepl("M$", col)) {
+        var_code <- gsub("M$", "", col)
+        if (var_code %in% names(name_map)) new_names[i] <- paste0(name_map[[var_code]], "_MOE")
+      }
+    }
+    if (any(duplicated(new_names))) new_names <- make.unique(new_names, sep = "_")
+    names(data) <- new_names
+  }, error = function(e) {
+    cat(paste("Warning: Could not load variable labels:", e$message, "\n"))
+  })
+  return(data)
+}
+
+# --- County Boundary Caching Functions ---
+
+get_cached_counties <- function(cache_dir) {
+  # Get or download US county boundaries with caching
+  cache_file <- file.path(cache_dir, "us_county_boundaries.gpkg")
+
+  # Create cache directory if it doesn't exist
+  if (!dir.exists(cache_dir)) {
+    dir.create(cache_dir, recursive = TRUE)
+    cat(paste("Created cache directory:", cache_dir, "\n"))
+  }
+
+  # Check if cache exists
+  if (file.exists(cache_file)) {
+    cat("Loading county boundaries from cache...\n")
+    counties <- tryCatch({
+      st_read(cache_file, quiet = TRUE)
+    }, error = function(e) {
+      cat(paste("Warning: Cache file corrupted, re-downloading...\n"))
+      NULL
+    })
+    if (!is.null(counties)) {
+      cat(paste("  Loaded", nrow(counties), "counties from cache\n"))
+      return(counties)
+    }
+  }
+
+  # Download all US county boundaries
+  cat("Downloading US county boundaries (first-time setup, will be cached)...\n")
+  counties <- tryCatch({
+    # Get counties for all states - use a simple variable just to get geometry
+    suppressMessages(get_acs(
+      geography = "county",
+      variables = "B01003_001",
+      year = 2022,  # Use a stable year for boundaries
+      survey = "acs5",
+      geometry = TRUE
+    ))
+  }, error = function(e) {
+    stop(paste("Failed to download county boundaries:", e$message))
+  })
+
+  cat(paste("  Downloaded", nrow(counties), "counties\n"))
+
+  # Keep only necessary columns (GEOID, NAME, geometry)
+  counties <- counties[, c("GEOID", "NAME")]
+
+  # Extract state FIPS from GEOID (first 2 digits)
+  counties$STATEFP <- substr(counties$GEOID, 1, 2)
+  counties$COUNTYFP <- substr(counties$GEOID, 3, 5)
+
+  # Save to cache
+  cat(paste("Caching county boundaries to:", cache_file, "\n"))
+  st_write(counties, cache_file, delete_dsn = TRUE, quiet = TRUE)
+
+  return(counties)
+}
+
+detect_counties_from_input <- function(input_data, counties) {
+  # Find which counties overlap with the input features
+  cat("Detecting counties that overlap input features...\n")
+
+  # Transform counties to match input CRS
+  counties_transformed <- suppressWarnings(st_transform(counties, st_crs(input_data)))
+
+  # Get bounding box of input and filter counties first (for performance)
+  input_bbox <- st_bbox(input_data)
+  # Add a small buffer to the bbox
+  buffer <- 0.1  # degrees approximately
+  suppressWarnings({
+    centroids <- st_coordinates(st_centroid(st_geometry(counties_transformed)))
+  })
+  counties_filtered <- counties_transformed[
+    centroids[,1] >= input_bbox["xmin"] - buffer &
+    centroids[,1] <= input_bbox["xmax"] + buffer &
+    centroids[,2] >= input_bbox["ymin"] - buffer &
+    centroids[,2] <= input_bbox["ymax"] + buffer,
+  ]
+
+  if (nrow(counties_filtered) == 0) {
+    # Fallback: try intersection with all counties
+    cat("  Bounding box filter found no counties, trying full intersection...\n")
+    counties_filtered <- counties_transformed
+  }
+
+  # Find counties that intersect with input features
+  suppressWarnings({
+    intersects <- st_intersects(counties_filtered, st_union(input_data))
+  })
+  overlapping_idx <- which(lengths(intersects) > 0)
+
+  if (length(overlapping_idx) == 0) {
+    stop("No counties found that overlap with input features. Check that your data has a valid coordinate system.")
+  }
+
+  overlapping_counties <- counties_filtered[overlapping_idx, ]
+
+  # Extract state and county FIPS
+  state_fips <- unique(overlapping_counties$STATEFP)
+  county_info <- data.frame(
+    state_fips = overlapping_counties$STATEFP,
+    county_fips = overlapping_counties$COUNTYFP,
+    name = overlapping_counties$NAME
+  )
+
+  cat(paste("  Found", nrow(overlapping_counties), "overlapping counties in",
+            length(state_fips), "state(s)\n"))
+
+  # Print county names
+  for (i in seq_len(nrow(county_info))) {
+    cat(paste("    -", county_info$name[i], "\n"))
+  }
+
+  return(list(
+    state_fips = state_fips,
+    county_info = county_info
+  ))
+}
+
+# State FIPS to abbreviation mapping
+fips_to_abbrev <- function(fips) {
+  mapping <- c(
+    "01"="AL", "02"="AK", "04"="AZ", "05"="AR", "06"="CA", "08"="CO", "09"="CT",
+    "10"="DE", "11"="DC", "12"="FL", "13"="GA", "15"="HI", "16"="ID", "17"="IL",
+    "18"="IN", "19"="IA", "20"="KS", "21"="KY", "22"="LA", "23"="ME", "24"="MD",
+    "25"="MA", "26"="MI", "27"="MN", "28"="MS", "29"="MO", "30"="MT", "31"="NE",
+    "32"="NV", "33"="NH", "34"="NJ", "35"="NM", "36"="NY", "37"="NC", "38"="ND",
+    "39"="OH", "40"="OK", "41"="OR", "42"="PA", "44"="RI", "45"="SC", "46"="SD",
+    "47"="TN", "48"="TX", "49"="UT", "50"="VT", "51"="VA", "53"="WA", "54"="WV",
+    "55"="WI", "56"="WY", "72"="PR"
+  )
+  return(mapping[fips])
+}
+
 # --- Main Script ---
 
 args <- commandArgs(trailingOnly = TRUE)
 
-# Parse arguments
+# Parse arguments (state is now auto-detected)
 input_fc <- args[1]
 year <- as.integer(args[2])
 survey <- args[3]
 variables <- parse_variables(args[4])
 var_type <- args[5]  # "count" or "rate"
 geography <- args[6]
-state <- parse_states(args[7])
-join_method <- args[8]  # "area" or "population"
-output_fc <- args[9]
-truncate_fields <- if (length(args) >= 10) toupper(args[10]) %in% c("TRUE", "T", "1", "YES") else TRUE
+join_method <- args[7]  # "area" or "population"
+output_fc <- args[8]
+truncate_fields <- if (length(args) >= 9) toupper(args[9]) %in% c("TRUE", "T", "1", "YES") else TRUE
+cache_dir <- if (length(args) >= 10) args[10] else file.path(dirname(input_fc), "cache")
 
 cat("=============================================================================\n")
 cat("ACS Join Data\n")
@@ -136,16 +344,18 @@ cat(paste("Survey:", survey, "\n"))
 cat(paste("Variables:", paste(variables, collapse = ", "), "\n"))
 cat(paste("Variable Type:", var_type, "\n"))
 cat(paste("Census Geography:", geography, "\n"))
-cat(paste("State(s):", paste(state, collapse = ", "), "\n"))
+cat(paste("State/County:", "(auto-detecting from input features)", "\n"))
 cat(paste("Join Method:", join_method, "\n"))
 cat(paste("Output:", output_fc, "\n"))
 cat("=============================================================================\n\n")
 
-# Load required packages
+# Load required packages (suppress startup messages)
 cat("Loading required R packages...\n")
-library(tidycensus)
-library(sf)
-library(dplyr)
+suppressPackageStartupMessages({
+  library(tidycensus)
+  library(sf)
+  library(dplyr)
+})
 
 # Disable s2 for geometry operations
 sf_use_s2(FALSE)
@@ -192,75 +402,99 @@ user_data$join_id <- seq_len(nrow(user_data))
 # Repair geometries
 user_data <- st_make_valid(user_data)
 
+# --- Auto-detect Counties ---
+cat("\n--- Auto-detecting Geographic Coverage ---\n")
+counties <- get_cached_counties(cache_dir)
+detected <- detect_counties_from_input(user_data, counties)
+
 # --- Download Census Data ---
-cat(paste("\nDownloading", geography, "level Census data...\n"))
+cat(paste("\nDownloading", geography, "level Census data for detected counties...\n"))
 
-acs_params <- list(
-  geography = geography,
-  state = state,
-  variables = variables,
-  year = year,
-  survey = survey,
-  geometry = TRUE,
-  output = "wide"
-)
+# Download data for each state, filtered by county
+all_census_data <- list()
 
-# Use full TIGER/Line files for ZCTA
-if (geography == "zcta") {
-  acs_params$cb <- FALSE
+for (state_fips in detected$state_fips) {
+  state_abbrev <- fips_to_abbrev(state_fips)
+  state_counties <- detected$county_info[detected$county_info$state_fips == state_fips, "county_fips"]
+
+  cat(paste("  Downloading", state_abbrev, "- counties:", paste(state_counties, collapse = ", "), "\n"))
+
+  acs_params <- list(
+    geography = geography,
+    state = state_abbrev,
+    variables = variables,
+    year = year,
+    survey = survey,
+    geometry = TRUE,
+    output = "wide"
+  )
+
+  # Add county filter for sub-state geographies
+  if (geography %in% c("tract", "block group", "county subdivision")) {
+    acs_params$county <- state_counties
+  }
+
+  # Use full TIGER/Line files for ZCTA
+  if (geography == "zcta") {
+    acs_params$cb <- FALSE
+  }
+
+  state_data <- tryCatch({
+    suppressMessages(do.call(get_acs, acs_params))
+  }, error = function(e) {
+    cat(paste("    Note: Could not download data for", state_abbrev, ":", e$message, "\n"))
+    NULL
+  })
+
+  if (!is.null(state_data) && nrow(state_data) > 0) {
+    all_census_data[[length(all_census_data) + 1]] <- state_data
+    cat(paste("    Downloaded", nrow(state_data), "features\n"))
+  }
 }
 
-census_data <- tryCatch({
-  do.call(get_acs, acs_params)
-}, error = function(e) {
-  stop(paste("Error downloading Census data:", e$message))
-})
+# Combine all downloaded data
+if (length(all_census_data) == 0) {
+  stop("Failed to download Census data for any of the detected counties.")
+}
 
-cat(paste("Downloaded", nrow(census_data), "Census features\n"))
+census_data <- do.call(rbind, all_census_data)
+cat(paste("\nTotal Census features downloaded:", nrow(census_data), "\n"))
+
+# Clean field names to be human-readable
+cat("Cleaning field names...\n")
+census_data <- clean_field_names(census_data, year, survey)
 
 # Repair Census geometries
-census_data <- st_make_valid(census_data)
+suppressWarnings({
+  census_data <- st_make_valid(census_data)
+})
 census_data <- census_data[!st_is_empty(census_data), ]
+
+# Ensure NAME field is preserved (fix potential truncation)
+if ("NAM" %in% names(census_data) && !"NAME" %in% names(census_data)) {
+  names(census_data)[names(census_data) == "NAM"] <- "NAME"
+}
 
 # --- Perform Spatial Join ---
 cat(paste("\nPerforming", join_method, "weighted spatial join...\n"))
 
-# Report CRS information
-cat("\n--- Coordinate Reference Systems ---\n")
-cat(paste("User data CRS:", st_crs(user_data)$input, "\n"))
-cat(paste("Census data CRS:", st_crs(census_data)$input, "\n"))
-
 # Transform Census data to match user's CRS
-census_data <- st_transform(census_data, st_crs(user_data))
-cat(paste("Census transformed to:", st_crs(census_data)$input, "\n"))
+suppressWarnings({
+  census_data <- st_transform(census_data, st_crs(user_data))
+})
 
-# Report bounding boxes
-cat("\n--- Bounding Boxes ---\n")
-user_bbox <- st_bbox(user_data)
-census_bbox <- st_bbox(census_data)
-cat(paste("User data extent:\n"))
-cat(paste("  xmin:", round(user_bbox["xmin"], 4), "xmax:", round(user_bbox["xmax"], 4), "\n"))
-cat(paste("  ymin:", round(user_bbox["ymin"], 4), "ymax:", round(user_bbox["ymax"], 4), "\n"))
-cat(paste("Census data extent:\n"))
-cat(paste("  xmin:", round(census_bbox["xmin"], 4), "xmax:", round(census_bbox["xmax"], 4), "\n"))
-cat(paste("  ymin:", round(census_bbox["ymin"], 4), "ymax:", round(census_bbox["ymax"], 4), "\n"))
-
-# Check for overlap
-cat("\n--- Overlap Check ---\n")
-# Quick intersection test on a sample
-sample_size <- min(1000, nrow(user_data))
-sample_indices <- sample(seq_len(nrow(user_data)), sample_size)
-sample_data <- user_data[sample_indices, ]
-sample_intersects <- st_intersects(sample_data, census_data)
-num_with_match <- sum(lengths(sample_intersects) > 0)
-cat(paste("Sample test:", num_with_match, "of", sample_size, "parcels intersect Census tracts\n"))
-cat(paste("Estimated coverage:", round(num_with_match / sample_size * 100, 1), "%\n"))
+# Quick overlap check
+suppressWarnings({
+  sample_size <- min(100, nrow(user_data))
+  sample_indices <- sample(seq_len(nrow(user_data)), sample_size)
+  sample_data <- user_data[sample_indices, ]
+  sample_intersects <- st_intersects(sample_data, census_data)
+  num_with_match <- sum(lengths(sample_intersects) > 0)
+})
 
 if (num_with_match < sample_size * 0.5) {
-  cat("\nWARNING: Less than 50% of parcels intersect Census tracts!\n")
-  cat("This may indicate a CRS or extent mismatch.\n")
+  cat(paste("Note: Only", round(num_with_match / sample_size * 100, 1), "% of features overlap Census data.\n"))
 }
-cat("\n")
 
 is_extensive <- tolower(var_type) == "count"
 
@@ -269,10 +503,13 @@ if (join_method == "population") {
   # For small polygons like parcels, we assign the value from the Census unit
   # that contains the parcel centroid, or has the largest overlap
   cat("Using population-weighted assignment...\n")
-  
-  # Get estimate columns from census data
-  est_cols <- grep("E$", names(census_data), value = TRUE)
-  moe_cols <- grep("M$", names(census_data), value = TRUE)
+
+  # Get estimate and MOE columns from census data (after field name cleaning)
+  # MOE columns end in "_MOE", estimate columns are everything else except system columns
+  system_cols <- c("GEOID", "NAME", "geometry", "census_area")
+  moe_cols <- grep("_MOE$", names(census_data), value = TRUE)
+  est_cols <- setdiff(names(census_data), c(system_cols, moe_cols, "geometry"))
+  est_cols <- est_cols[!est_cols %in% c("GEOID", "NAME")]
   census_cols <- c(est_cols, moe_cols)
   
   # Method: Use centroids for point-in-polygon assignment (fast and appropriate for parcels)
@@ -282,25 +519,29 @@ if (join_method == "population") {
   })
   
   cat("Performing spatial join (centroid within Census unit)...\n")
-  joined <- st_join(user_centroids, census_data[, c("GEOID", census_cols)], join = st_within, left = TRUE)
-  
+  suppressWarnings({
+    joined <- st_join(user_centroids, census_data[, c("GEOID", census_cols)], join = st_within, left = TRUE)
+  })
+
   # Check how many got matched
   matched <- sum(!is.na(joined$GEOID))
   cat(paste("Centroid join matched:", matched, "of", nrow(user_data), "features\n"))
-  
+
   # For any unmatched (centroid outside all tracts), try nearest neighbor
   unmatched_idx <- which(is.na(joined$GEOID))
   if (length(unmatched_idx) > 0) {
     cat(paste("Finding nearest Census unit for", length(unmatched_idx), "unmatched features...\n"))
-    
+
     unmatched_centroids <- user_centroids[unmatched_idx, ]
-    nearest_idx <- st_nearest_feature(unmatched_centroids, census_data)
-    
+    suppressWarnings({
+      nearest_idx <- st_nearest_feature(unmatched_centroids, census_data)
+    })
+
     for (col in census_cols) {
       joined[[col]][unmatched_idx] <- census_data[[col]][nearest_idx]
     }
     joined$GEOID[unmatched_idx] <- census_data$GEOID[nearest_idx]
-    
+
     cat("Nearest neighbor assignment complete.\n")
   }
   
@@ -314,20 +555,28 @@ if (join_method == "population") {
 } else if (join_method == "area") {
   # Area-weighted interpolation
   cat("Using area-weighted interpolation...\n")
-  
+
   # Calculate areas
-  census_data$census_area <- as.numeric(st_area(census_data))
-  
+  suppressWarnings({
+    census_data$census_area <- as.numeric(st_area(census_data))
+  })
+
   # Perform intersection
   cat("Intersecting features...\n")
-  intersected <- st_intersection(user_data, census_data)
-  intersected$intersect_area <- as.numeric(st_area(intersected))
-  
+  suppressWarnings({
+    intersected <- st_intersection(user_data, census_data)
+    intersected$intersect_area <- as.numeric(st_area(intersected))
+  })
+
   # Calculate proportion of each census unit in intersection
   intersected$weight <- intersected$intersect_area / intersected$census_area
-  
-  # Get estimate columns
-  est_cols <- grep("E$", names(census_data), value = TRUE)
+
+  # Get estimate columns (after field name cleaning)
+  # Exclude system columns, MOE columns, and geometry
+  system_cols <- c("GEOID", "NAME", "geometry", "census_area", "join_id", "intersect_area", "weight")
+  moe_cols <- grep("_MOE$", names(census_data), value = TRUE)
+  est_cols <- setdiff(names(census_data), c(system_cols, moe_cols))
+  est_cols <- est_cols[!est_cols %in% c("GEOID", "NAME")]
   
   # Aggregate to user features
   cat("Aggregating values...\n")
@@ -358,25 +607,33 @@ if (join_method == "population") {
 # Remove temporary join_id
 result$join_id <- NULL
 
+# Fix any truncated NAME fields
+if ("NAM" %in% names(result) && !"NAME" %in% names(result)) {
+  names(result)[names(result) == "NAM"] <- "NAME"
+}
+
 cat(paste("\nProcessed", nrow(result), "features\n"))
 
 # --- Write Output ---
 output_format <- detect_output_format(output_fc)
-cat(paste("Output format:", output_format, "\n"))
 
 if (output_format == "shapefile" && truncate_fields) {
-  cat("Truncating field names to 10 characters...\n")
+  cat("Truncating field names to 10 characters for shapefile...\n")
   result <- truncate_shapefile_fields(result)
 }
 
 cat("Writing output...\n")
-if (output_format == "geopackage") {
-  st_write(result, output_fc, delete_dsn = TRUE, quiet = TRUE)
-} else {
-  st_write(result, output_fc, delete_layer = TRUE, quiet = TRUE)
-}
+suppressWarnings({
+  if (output_format == "geopackage") {
+    st_write(result, output_fc, delete_dsn = TRUE, quiet = TRUE)
+  } else {
+    st_write(result, output_fc, delete_layer = TRUE, quiet = TRUE)
+  }
+})
 
 cat(paste("\nSuccessfully created:", output_fc, "\n"))
 cat(paste("Total features:", nrow(result), "\n"))
-cat(paste("Census fields added:", length(grep("E$", names(result), value = TRUE)), "\n"))
+# Count Census fields (exclude MOE columns for the estimate count)
+moe_count <- length(grep("_MOE$", names(result), value = TRUE))
+cat(paste("Census fields added:", moe_count, "estimates +", moe_count, "MOE fields\n"))
 cat("Done!\n")
