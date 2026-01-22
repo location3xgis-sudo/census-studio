@@ -20,7 +20,7 @@ class Toolbox(object):
     def __init__(self):
         self.label = "Census Studio"
         self.alias = "censusstudio"
-        self.tools = [DownloadACSDataR, CompareTimePeriods, JoinACSData, NormalizeData, MOEReliabilityFilter, DemographicProfileReport, HotSpotAnalysis, GenerateVariableLookup, SetCensusAPIKey]
+        self.tools = [DownloadACSDataR, DownloadDecennialCensus, CompareTimePeriods, JoinACSData, NormalizeData, MOEReliabilityFilter, AggregateData, DemographicProfileReport, HotSpotAnalysis, GenerateVariableLookup, SetCensusAPIKey]
 
 
 class DownloadACSDataR(object):
@@ -174,13 +174,13 @@ class DownloadACSDataR(object):
         p8.description = "Select one or more states. When multiple states are selected, county names will be prefixed with the state abbreviation."
 
         p9 = arcpy.Parameter(
-            displayName="County FIPS Codes (optional, comma-separated)",
+            displayName="County (optional, comma-separated)",
             name="county",
             datatype="GPString",
             parameterType="Optional",
             direction="Input",
             category="Geography")
-        p9.description = "Enter county FIPS codes (comma-separated, e.g., '029, 037, 071'). Leave blank for all counties in selected state(s). Find codes at: https://www.census.gov/library/reference/code-lists/ansi.html"
+        p9.description = "Enter county names or FIPS codes (comma-separated, e.g., 'Travis, Williamson' or '453, 491'). Leave blank for all counties in selected state(s)."
 
         p10 = arcpy.Parameter(
             displayName="ZCTA (comma separated for multiple ZCTAs)",
@@ -996,6 +996,415 @@ class JoinACSData(object):
                 shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+class DownloadDecennialCensus(object):
+    def __init__(self):
+        self.label = "Download Decennial Census Data"
+        self.description = "Download Decennial Census data (2000, 2010, 2020) including block-level geography"
+        self.canRunInBackground = False
+        self.category = "Census Data"
+
+        # User-friendly variable groups with actual Census variable codes
+        # Format: "Friendly Name": {"variables": [...], "description": "..."}
+        self.variable_groups = {
+            # 2020 PL/DHC variables
+            "2020": {
+                "Total Population": {
+                    "variables": ["P1_001N"],
+                    "description": "Total population count"
+                },
+                "Population by Race": {
+                    "variables": ["P1_003N", "P1_004N", "P1_005N", "P1_006N", "P1_007N", "P1_008N", "P1_009N"],
+                    "description": "White, Black, American Indian/Alaska Native, Asian, Native Hawaiian/Pacific Islander, Other, Two or More Races"
+                },
+                "Hispanic or Latino Origin": {
+                    "variables": ["P2_002N", "P2_003N"],
+                    "description": "Hispanic/Latino and Not Hispanic/Latino population"
+                },
+                "Population 18 Years and Over": {
+                    "variables": ["P3_001N"],
+                    "description": "Voting age population (18+)"
+                },
+                "Voting Age by Race": {
+                    "variables": ["P3_003N", "P3_004N", "P3_005N", "P3_006N", "P3_007N", "P3_008N", "P3_009N"],
+                    "description": "Voting age population by race categories"
+                },
+                "Voting Age Hispanic/Latino": {
+                    "variables": ["P4_002N", "P4_003N"],
+                    "description": "Voting age Hispanic/Latino and Not Hispanic/Latino"
+                },
+                "Total Housing Units": {
+                    "variables": ["H1_001N"],
+                    "description": "Total housing unit count"
+                },
+                "Housing Occupancy Status": {
+                    "variables": ["H1_002N", "H1_003N"],
+                    "description": "Occupied and Vacant housing units"
+                },
+                "Group Quarters Population": {
+                    "variables": ["P5_001N", "P5_002N", "P5_003N"],
+                    "description": "Total, Institutionalized, and Non-institutionalized group quarters population"
+                }
+            },
+            # 2010 SF1/PL variables (different naming convention)
+            "2010": {
+                "Total Population": {
+                    "variables": ["P001001"],
+                    "description": "Total population count"
+                },
+                "Population by Race": {
+                    "variables": ["P003002", "P003003", "P003004", "P003005", "P003006", "P003007", "P003008"],
+                    "description": "White, Black, American Indian/Alaska Native, Asian, Native Hawaiian/Pacific Islander, Other, Two or More Races"
+                },
+                "Hispanic or Latino Origin": {
+                    "variables": ["P004002", "P004003"],
+                    "description": "Hispanic/Latino and Not Hispanic/Latino population"
+                },
+                "Population 18 Years and Over": {
+                    "variables": ["P010001"],
+                    "description": "Voting age population (18+)"
+                },
+                "Voting Age by Race": {
+                    "variables": ["P010003", "P010004", "P010005", "P010006", "P010007", "P010008", "P010009"],
+                    "description": "Voting age population by race categories"
+                },
+                "Voting Age Hispanic/Latino": {
+                    "variables": ["P011002", "P011003"],
+                    "description": "Voting age Hispanic/Latino and Not Hispanic/Latino"
+                },
+                "Total Housing Units": {
+                    "variables": ["H001001"],
+                    "description": "Total housing unit count"
+                },
+                "Housing Occupancy Status": {
+                    "variables": ["H003002", "H003003"],
+                    "description": "Occupied and Vacant housing units"
+                },
+                "Housing Tenure": {
+                    "variables": ["H004002", "H004003"],
+                    "description": "Owner-occupied and Renter-occupied housing units"
+                },
+                "Group Quarters Population": {
+                    "variables": ["P029001", "P029002", "P029003"],
+                    "description": "Total, Institutionalized, and Non-institutionalized group quarters population"
+                }
+            },
+            # 2000 SF1 variables
+            "2000": {
+                "Total Population": {
+                    "variables": ["P001001"],
+                    "description": "Total population count"
+                },
+                "Population by Race": {
+                    "variables": ["P003002", "P003003", "P003004", "P003005", "P003006", "P003007", "P003008"],
+                    "description": "White, Black, American Indian/Alaska Native, Asian, Native Hawaiian/Pacific Islander, Other, Two or More Races"
+                },
+                "Hispanic or Latino Origin": {
+                    "variables": ["P004002", "P004003"],
+                    "description": "Hispanic/Latino and Not Hispanic/Latino population"
+                },
+                "Population 18 Years and Over": {
+                    "variables": ["P006001"],
+                    "description": "Voting age population (18+)"
+                },
+                "Total Housing Units": {
+                    "variables": ["H001001"],
+                    "description": "Total housing unit count"
+                },
+                "Housing Occupancy Status": {
+                    "variables": ["H003002", "H003003"],
+                    "description": "Occupied and Vacant housing units"
+                },
+                "Housing Tenure": {
+                    "variables": ["H004002", "H004003"],
+                    "description": "Owner-occupied and Renter-occupied housing units"
+                }
+            }
+        }
+
+    def _find_rscript(self):
+        for base_path in [r"C:\Program Files\R", r"C:\Program Files (x86)\R"]:
+            if os.path.exists(base_path):
+                try:
+                    r_versions = [d for d in os.listdir(base_path) if d.startswith("R-")]
+                    if r_versions:
+                        r_versions.sort(reverse=True)
+                        rscript = os.path.join(base_path, r_versions[0], "bin", "Rscript.exe")
+                        if os.path.exists(rscript):
+                            return rscript
+                except Exception:
+                    continue
+        return None
+
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(
+            displayName="Census Year",
+            name="year",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
+        p0.filter.type = "ValueList"
+        p0.filter.list = ["2020", "2010", "2000"]
+        p0.value = "2020"
+        p0.description = "Decennial Census year. 2020 is the most recent."
+
+        p1 = arcpy.Parameter(
+            displayName="Data Topic",
+            name="topic",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+            multiValue=True)
+        p1.filter.type = "ValueList"
+        p1.filter.list = []
+        p1.description = "Select one or more data topics to download."
+
+        p2 = arcpy.Parameter(
+            displayName="Or Enter Variable Codes Manually",
+            name="variables_manual",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        p2.description = "Enter variable codes directly (comma-separated). Use this if you know the specific codes you need."
+
+        p3 = arcpy.Parameter(
+            displayName="Geography Level",
+            name="geography",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
+        p3.filter.type = "ValueList"
+        p3.filter.list = [
+            "state", "county", "tract", "block group", "block",
+            "place", "county subdivision", "zcta",
+            "congressional district", "state legislative district (upper chamber)",
+            "state legislative district (lower chamber)"]
+        p3.value = "tract"
+        p3.description = "Geographic level. Block is the smallest (only available in Decennial Census, not ACS)."
+
+        p4 = arcpy.Parameter(
+            displayName="State",
+            name="state",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+            multiValue=True)
+        p4.filter.type = "ValueList"
+        p4.filter.list = [
+            "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL",
+            "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME",
+            "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH",
+            "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "PR",
+            "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
+            "WI", "WY"]
+        p4.description = "Select one or more states. Required for county, tract, block group, and block geographies."
+
+        p5 = arcpy.Parameter(
+            displayName="County (optional, comma-separated)",
+            name="county",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        p5.description = "Limit to specific counties by name or FIPS code (e.g., 'Travis' or '453'). Recommended for block-level downloads to manage file size."
+
+        p6 = arcpy.Parameter(
+            displayName="Output Feature Class",
+            name="output_fc",
+            datatype="DEFeatureClass",
+            parameterType="Required",
+            direction="Output")
+        p6.description = "Output location for the feature class."
+
+        return [p0, p1, p2, p3, p4, p5, p6]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        year_param = parameters[0]
+        topic_param = parameters[1]
+        geo_param = parameters[3]
+        state_param = parameters[4]
+        county_param = parameters[5]
+
+        # Update topic list based on year
+        if year_param.altered or not topic_param.filter.list:
+            year = year_param.valueAsText
+            if year and year in self.variable_groups:
+                topic_param.filter.list = list(self.variable_groups[year].keys())
+
+        # Enable/disable state based on geography
+        geo_level = geo_param.valueAsText
+        if geo_level in ["state", "zcta"]:
+            state_param.enabled = False
+        else:
+            state_param.enabled = True
+
+        # Enable/disable county based on geography
+        if geo_level in ["state", "county", "zcta", "congressional district"]:
+            county_param.enabled = False
+        else:
+            county_param.enabled = True
+
+    def updateMessages(self, parameters):
+        topic_param = parameters[1]
+        manual_param = parameters[2]
+        geo_param = parameters[3]
+        state_param = parameters[4]
+        county_param = parameters[5]
+
+        # Require either topic selection or manual variables
+        if not topic_param.values and not manual_param.valueAsText:
+            topic_param.setErrorMessage("Select at least one data topic or enter variable codes manually.")
+
+        # Require state for sub-state geographies
+        geo_level = geo_param.valueAsText
+        if geo_level in ["county", "tract", "block group", "block", "place", "county subdivision"]:
+            if not state_param.values:
+                state_param.setErrorMessage(f"State is required for {geo_level} geography.")
+
+        # Warn about block-level data size
+        if geo_level == "block" and not county_param.valueAsText:
+            county_param.setWarningMessage("Block-level data for an entire state can be very large. Consider specifying counties.")
+
+    def execute(self, parameters, messages):
+        import time
+
+        year = parameters[0].valueAsText
+        topics = parameters[1].values if parameters[1].values else []
+        manual_vars = parameters[2].valueAsText
+        geography = parameters[3].valueAsText
+        states = parameters[4].values if parameters[4].values else []
+        county = parameters[5].valueAsText
+        output_fc = parameters[6].valueAsText
+
+        arcpy.AddMessage("=" * 60)
+        arcpy.AddMessage("Download Decennial Census Data")
+        arcpy.AddMessage("=" * 60)
+        arcpy.AddMessage(f"  Year: {year}")
+        arcpy.AddMessage(f"  Geography: {geography}")
+        if states:
+            arcpy.AddMessage(f"  State(s): {', '.join(states)}")
+        if county:
+            arcpy.AddMessage(f"  County: {county}")
+        arcpy.AddMessage("=" * 60)
+
+        # Build variable list from selected topics
+        variables = []
+        if topics:
+            year_vars = self.variable_groups.get(year, {})
+            for topic in topics:
+                if topic in year_vars:
+                    variables.extend(year_vars[topic]["variables"])
+                    arcpy.AddMessage(f"  Topic: {topic}")
+                    arcpy.AddMessage(f"    Variables: {', '.join(year_vars[topic]['variables'])}")
+
+        # Add manual variables
+        if manual_vars:
+            manual_list = [v.strip() for v in manual_vars.split(",") if v.strip()]
+            variables.extend(manual_list)
+            arcpy.AddMessage(f"  Manual variables: {', '.join(manual_list)}")
+
+        # Remove duplicates while preserving order
+        seen = set()
+        variables = [v for v in variables if not (v in seen or seen.add(v))]
+
+        if not variables:
+            arcpy.AddError("No variables specified.")
+            return
+
+        arcpy.AddMessage(f"\nTotal variables: {len(variables)}")
+
+        # Always use PL (redistricting) dataset - has core population, race, ethnicity, housing data
+        sumfile = "pl"
+
+        # Find R script
+        script_path = os.path.join(os.path.dirname(__file__), "decennial_download.R")
+        if not os.path.exists(script_path):
+            arcpy.AddError(f"R script not found: {script_path}")
+            return
+
+        rscript = self._find_rscript()
+        if not rscript:
+            arcpy.AddError("Could not find Rscript.exe. Please ensure R is installed.")
+            return
+
+        arcpy.AddMessage(f"Using R: {rscript}")
+
+        # Create temp directory for intermediate files
+        temp_dir = tempfile.mkdtemp(prefix="decennial_")
+        temp_output = os.path.join(temp_dir, "output.gpkg")
+
+        # Build state string
+        state_str = ",".join(states) if states else ""
+
+        # Build command (geometry always included)
+        cmd = [
+            rscript, script_path,
+            year,
+            sumfile,
+            ",".join(variables),
+            geography,
+            state_str,
+            county or "",
+            temp_output.replace("\\", "/")
+        ]
+
+        arcpy.AddMessage("\nCalling R script...")
+
+        try:
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, cwd=os.path.dirname(script_path))
+
+            while True:
+                line = process.stdout.readline()
+                if line == '' and process.poll() is not None:
+                    break
+                if line:
+                    arcpy.AddMessage(line.strip())
+
+            stderr = process.stderr.read()
+            if stderr:
+                arcpy.AddMessage("\n--- R Script Output (stderr) ---")
+                for line in stderr.split('\n'):
+                    if line.strip():
+                        arcpy.AddError(line)
+                arcpy.AddMessage("--- End stderr ---\n")
+
+            if process.returncode != 0:
+                arcpy.AddError(f"R script failed with code {process.returncode}")
+                return
+
+            # Copy to final output - need to specify layer inside GeoPackage
+            if os.path.exists(temp_output):
+                arcpy.AddMessage(f"\nCopying to output: {output_fc}")
+                # List layers in the GeoPackage and use the first one
+                arcpy.env.workspace = temp_output
+                layers = arcpy.ListFeatureClasses()
+                if layers:
+                    gpkg_layer = os.path.join(temp_output, layers[0])
+                    arcpy.management.CopyFeatures(gpkg_layer, output_fc)
+                    arcpy.AddMessage("=" * 60)
+                    arcpy.AddMessage(f"SUCCESS: {output_fc}")
+                    arcpy.AddMessage("=" * 60)
+                else:
+                    arcpy.AddError("GeoPackage contains no feature classes.")
+            else:
+                arcpy.AddError("R script did not produce output file.")
+
+        except Exception as e:
+            arcpy.AddError(f"Error running R script: {str(e)}")
+
+        # Cleanup
+        try:
+            time.sleep(1)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
 
 class CompareTimePeriods(object):
     def __init__(self):
@@ -2167,6 +2576,256 @@ class MOEReliabilityFilter(object):
         arcpy.AddMessage("=" * 60)
         arcpy.AddMessage("Reliability analysis complete!")
 
+
+class AggregateData(object):
+    def __init__(self):
+        self.label = "Aggregate Data"
+        self.description = "Aggregate numeric fields from source polygons to target zones using area or population weighting with proper MOE propagation"
+        self.canRunInBackground = False
+        self.category = "Data Enrichment"
+
+    def _find_rscript(self):
+        for base_path in [r"C:\Program Files\R", r"C:\Program Files (x86)\R"]:
+            if os.path.exists(base_path):
+                try:
+                    r_versions = [d for d in os.listdir(base_path) if d.startswith("R-")]
+                    if r_versions:
+                        r_versions.sort(reverse=True)
+                        rscript = os.path.join(base_path, r_versions[0], "bin", "Rscript.exe")
+                        if os.path.exists(rscript):
+                            return rscript
+                except Exception:
+                    continue
+        return None
+
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(
+            displayName="Source Feature Class",
+            name="source_fc",
+            datatype="GPFeatureLayer",
+            parameterType="Required",
+            direction="Input",
+            category="Input Data")
+        p0.filter.list = ["Polygon"]
+        p0.description = "Polygon layer containing the numeric fields to aggregate."
+
+        p1 = arcpy.Parameter(
+            displayName="Target Feature Class",
+            name="target_fc",
+            datatype="GPFeatureLayer",
+            parameterType="Required",
+            direction="Input",
+            category="Input Data")
+        p1.filter.list = ["Polygon"]
+        p1.description = "Polygon layer defining the output aggregation zones (e.g., counties, districts, neighborhoods)."
+
+        p2 = arcpy.Parameter(
+            displayName="Fields to Aggregate",
+            name="fields_to_aggregate",
+            datatype="Field",
+            parameterType="Required",
+            direction="Input",
+            category="Aggregation Settings",
+            multiValue=True)
+        p2.parameterDependencies = [p0.name]
+        p2.filter.list = ["Short", "Long", "Float", "Double"]
+        p2.description = "Select numeric fields from the source layer to aggregate. MOE fields (ending in '_MOE') will be detected and propagated automatically."
+
+        p3 = arcpy.Parameter(
+            displayName="Variable Type",
+            name="variable_type",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+            category="Aggregation Settings")
+        p3.filter.type = "ValueList"
+        p3.filter.list = ["Count (sum values)", "Rate/Median (weighted average)"]
+        p3.value = "Count (sum values)"
+        p3.description = "Counts are summed proportionally. Rates and medians are calculated as weighted averages."
+
+        p4 = arcpy.Parameter(
+            displayName="Aggregation Method",
+            name="aggregation_method",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+            category="Aggregation Settings")
+        p4.filter.type = "ValueList"
+        p4.filter.list = ["Area Weighted", "Population Weighted"]
+        p4.value = "Area Weighted"
+        p4.description = "Area weighted uses geometric overlap proportions. Population weighted uses 2020 Census block populations (more accurate for demographic data)."
+
+        p5 = arcpy.Parameter(
+            displayName="Output Feature Class",
+            name="output_fc",
+            datatype="DEFeatureClass",
+            parameterType="Required",
+            direction="Output",
+            category="Output")
+        p5.description = "Output feature class with target zones and aggregated values."
+
+        return [p0, p1, p2, p3, p4, p5]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        pass
+
+    def updateMessages(self, parameters):
+        source_fc = parameters[0]
+        target_fc = parameters[1]
+        fields = parameters[2]
+
+        # Validate source is polygon
+        if source_fc.value:
+            desc = arcpy.Describe(source_fc.valueAsText)
+            if hasattr(desc, 'shapeType') and desc.shapeType != "Polygon":
+                source_fc.setErrorMessage("Source must be a polygon feature class")
+
+        # Validate target is polygon
+        if target_fc.value:
+            desc = arcpy.Describe(target_fc.valueAsText)
+            if hasattr(desc, 'shapeType') and desc.shapeType != "Polygon":
+                target_fc.setErrorMessage("Target must be a polygon feature class")
+
+        # Check at least one field selected
+        if fields.altered and not fields.value:
+            fields.setErrorMessage("Select at least one field to aggregate")
+
+    def execute(self, parameters, messages):
+        source_fc = parameters[0].valueAsText
+        target_fc = parameters[1].valueAsText
+        # Convert field value objects to strings
+        fields_to_aggregate = [str(f) for f in parameters[2].values] if parameters[2].values else []
+        variable_type = "count" if "Count" in parameters[3].valueAsText else "rate"
+        aggregation_method = "area" if "Area" in parameters[4].valueAsText else "population"
+        output_path = parameters[5].valueAsText
+
+        arcpy.AddMessage("=" * 60)
+        arcpy.AddMessage("Aggregate Data")
+        arcpy.AddMessage("=" * 60)
+        arcpy.AddMessage(f"Source: {source_fc}")
+        arcpy.AddMessage(f"Target: {target_fc}")
+        arcpy.AddMessage(f"Fields: {', '.join(fields_to_aggregate)}")
+        arcpy.AddMessage(f"Variable Type: {variable_type}")
+        arcpy.AddMessage(f"Method: {aggregation_method}")
+        arcpy.AddMessage(f"Output: {output_path}")
+        arcpy.AddMessage("=" * 60)
+
+        # Find R
+        rscript = self._find_rscript()
+        if not rscript:
+            arcpy.AddError("Could not find Rscript.exe. Please install R.")
+            return
+
+        arcpy.AddMessage(f"Using R: {rscript}")
+
+        # Create temp workspace
+        temp_dir = tempfile.mkdtemp(prefix="aggregate_")
+        temp_gdb = os.path.join(temp_dir, "temp.gdb")
+
+        try:
+            arcpy.management.CreateFileGDB(temp_dir, "temp.gdb")
+
+            # Export source and target to temp GDB
+            arcpy.AddMessage("Exporting data to temporary workspace...")
+            temp_source = os.path.join(temp_gdb, "source_features")
+            temp_target = os.path.join(temp_gdb, "target_features")
+
+            arcpy.management.CopyFeatures(source_fc, temp_source)
+            arcpy.management.CopyFeatures(target_fc, temp_target)
+
+            arcpy.AddMessage(f"  Source: {int(arcpy.management.GetCount(temp_source)[0])} features")
+            arcpy.AddMessage(f"  Target: {int(arcpy.management.GetCount(temp_target)[0])} features")
+
+            # Prepare field list
+            fields_str = ",".join(fields_to_aggregate)
+
+            # Set up output (GeoPackage for R, then convert)
+            temp_output = os.path.join(temp_dir, "output.gpkg")
+
+            # Cache directory
+            script_dir = os.path.dirname(__file__)
+            cache_dir = os.path.join(script_dir, "cache")
+
+            # Build R command
+            script_path = os.path.join(script_dir, "aggregate_data.R")
+
+            cmd = [
+                rscript, script_path,
+                temp_source.replace("\\", "/"),
+                temp_target.replace("\\", "/"),
+                fields_str,
+                variable_type,
+                aggregation_method,
+                temp_output.replace("\\", "/"),
+                cache_dir.replace("\\", "/")
+            ]
+
+            arcpy.AddMessage("")
+            arcpy.AddMessage("Calling R script...")
+
+            # Execute R
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=script_dir
+            )
+
+            # Stream output
+            while True:
+                line = process.stdout.readline()
+                if line == '' and process.poll() is not None:
+                    break
+                if line:
+                    arcpy.AddMessage(line.rstrip())
+
+            # Check for errors
+            stderr = process.stderr.read()
+            if stderr:
+                for line in stderr.split('\n'):
+                    if line.strip():
+                        # Filter out common R messages
+                        if any(skip in line for skip in ["Attaching", "masked", "Linking"]):
+                            continue
+                        arcpy.AddWarning(line)
+
+            r_success = process.returncode == 0
+
+            # Copy result to final output
+            if r_success and os.path.exists(temp_output):
+                arcpy.AddMessage("")
+                arcpy.AddMessage("Copying results to output location...")
+
+                # List layers in GeoPackage
+                arcpy.env.workspace = temp_output
+                layers = arcpy.ListFeatureClasses()
+
+                if layers:
+                    gpkg_layer = os.path.join(temp_output, layers[0])
+                    arcpy.management.CopyFeatures(gpkg_layer, output_path)
+                    arcpy.AddMessage(f"Created: {output_path}")
+                else:
+                    arcpy.AddError("No output layer found in GeoPackage")
+            elif not r_success:
+                arcpy.AddError("R script failed. Check messages above.")
+
+        except Exception as e:
+            arcpy.AddError(f"Error: {str(e)}")
+            raise
+
+        finally:
+            # Cleanup
+            arcpy.ClearWorkspaceCache_management()
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except:
+                pass
+
+
 class GenerateVariableLookup(object):
     def __init__(self):
         self.label = "Generate Variable Lookup File"
@@ -2401,6 +3060,140 @@ class DemographicProfileReport(object):
                     continue
         return None
 
+    def _get_cache_path(self):
+        """Get path to cache directory"""
+        return os.path.join(os.path.dirname(__file__), "cache")
+
+    def _download_county_boundaries(self):
+        """Download US county boundaries from Census Bureau and cache them"""
+        import urllib.request
+        import zipfile
+
+        cache_dir = self._get_cache_path()
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+
+        county_cache = os.path.join(cache_dir, "us_county_boundaries.gpkg")
+
+        # Download Census Bureau cartographic boundary file (20m resolution - smaller file)
+        url = "https://www2.census.gov/geo/tiger/GENZ2022/shp/cb_2022_us_county_20m.zip"
+
+        try:
+            # Create temp directory for download
+            temp_dir = tempfile.mkdtemp(prefix="county_download_")
+            zip_path = os.path.join(temp_dir, "counties.zip")
+
+            # Download the file
+            urllib.request.urlretrieve(url, zip_path)
+
+            # Extract the zip
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+
+            # Find the shapefile
+            shp_file = None
+            for f in os.listdir(temp_dir):
+                if f.endswith('.shp'):
+                    shp_file = os.path.join(temp_dir, f)
+                    break
+
+            if shp_file:
+                # Convert to GeoPackage using arcpy
+                arcpy.management.CopyFeatures(shp_file, county_cache)
+
+            # Clean up temp directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+            return os.path.exists(county_cache)
+
+        except Exception as e:
+            # Clean up on error
+            if 'temp_dir' in locals():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            return False
+
+    def _detect_counties(self, study_area_layer):
+        """Detect counties that overlap with study area features"""
+        cache_dir = self._get_cache_path()
+        county_cache = os.path.join(cache_dir, "us_county_boundaries.gpkg")
+
+        # Download county boundaries if not cached
+        if not os.path.exists(county_cache):
+            if not self._download_county_boundaries():
+                return []
+
+        try:
+            # Get the layer path inside the GeoPackage
+            # List feature classes in the GeoPackage to find the layer name
+            arcpy.env.workspace = county_cache
+            fc_list = arcpy.ListFeatureClasses()
+            if not fc_list:
+                # Try to re-download if GeoPackage is empty/corrupt
+                os.remove(county_cache)
+                if not self._download_county_boundaries():
+                    return []
+                fc_list = arcpy.ListFeatureClasses()
+                if not fc_list:
+                    return []
+
+            # Use the first (and likely only) feature class
+            county_fc = os.path.join(county_cache, fc_list[0])
+
+            # Check what fields exist
+            field_names = [f.name for f in arcpy.ListFields(county_fc)]
+
+            # Determine field names (R script uses NAME, STATEFP, COUNTYFP; Census shp has similar)
+            name_field = "NAME" if "NAME" in field_names else "name" if "name" in field_names else None
+            state_field = "STATEFP" if "STATEFP" in field_names else "statefp" if "statefp" in field_names else None
+            county_field = "COUNTYFP" if "COUNTYFP" in field_names else "countyfp" if "countyfp" in field_names else None
+
+            if not all([name_field, state_field, county_field]):
+                return []
+
+            # Create a temporary dissolved version of study area
+            temp_dir = tempfile.mkdtemp(prefix="acs_detect_")
+            dissolved = os.path.join(temp_dir, "dissolved.shp")
+            arcpy.management.Dissolve(study_area_layer, dissolved)
+
+            # Select counties that intersect with study area
+            county_layer = "county_temp_layer_" + str(id(self))
+            if arcpy.Exists(county_layer):
+                arcpy.management.Delete(county_layer)
+            arcpy.management.MakeFeatureLayer(county_fc, county_layer)
+            arcpy.management.SelectLayerByLocation(county_layer, "INTERSECT", dissolved)
+
+            # Get selected counties
+            counties = []
+            with arcpy.da.SearchCursor(county_layer, [name_field, state_field, county_field]) as cursor:
+                for row in cursor:
+                    counties.append({
+                        "name": row[0],
+                        "state_fips": row[1],
+                        "county_fips": row[2]
+                    })
+
+            # Clean up
+            arcpy.management.Delete(county_layer)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+            return counties
+        except Exception as e:
+            return []
+
+    def _fips_to_state_abbrev(self, fips):
+        """Convert state FIPS code to abbreviation"""
+        mapping = {
+            "01": "AL", "02": "AK", "04": "AZ", "05": "AR", "06": "CA", "08": "CO", "09": "CT",
+            "10": "DE", "11": "DC", "12": "FL", "13": "GA", "15": "HI", "16": "ID", "17": "IL",
+            "18": "IN", "19": "IA", "20": "KS", "21": "KY", "22": "LA", "23": "ME", "24": "MD",
+            "25": "MA", "26": "MI", "27": "MN", "28": "MS", "29": "MO", "30": "MT", "31": "NE",
+            "32": "NV", "33": "NH", "34": "NJ", "35": "NM", "36": "NY", "37": "NC", "38": "ND",
+            "39": "OH", "40": "OK", "41": "OR", "42": "PA", "44": "RI", "45": "SC", "46": "SD",
+            "47": "TN", "48": "TX", "49": "UT", "50": "VT", "51": "VA", "53": "WA", "54": "WV",
+            "55": "WI", "56": "WY", "72": "PR"
+        }
+        return mapping.get(fips, fips)
+
     def _get_all_variables(self, selected_indicators):
         """Extract all variable codes needed for selected indicators"""
         variables = set()
@@ -2428,7 +3221,7 @@ class DemographicProfileReport(object):
             parameterType="Required",
             direction="Input")
         p0.filter.list = ["Polygon"]
-        p0.description = "Polygon layer defining the study area. Uses selected features if present, otherwise all features."
+        p0.description = "Polygon layer defining the study area. If features are selected, only selected features will be used."
 
         p1 = arcpy.Parameter(
             displayName="Indicators",
@@ -2477,124 +3270,134 @@ class DemographicProfileReport(object):
         p4.description = "ACS 5-Year (all geographies) or 1-Year (areas 65,000+ population only)."
 
         p5 = arcpy.Parameter(
-            displayName="State",
-            name="state",
-            datatype="GPString",
-            parameterType="Required",
-            direction="Input")
-        p5.filter.type = "ValueList"
-        p5.filter.list = [
-            "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL",
-            "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME",
-            "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH",
-            "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "PR",
-            "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
-            "WI", "WY"]
-        p5.description = "State containing the study area."
-
-        p6 = arcpy.Parameter(
-            displayName="County (optional)",
-            name="county",
-            datatype="GPString",
-            parameterType="Optional",
-            direction="Input")
-        p6.description = "County name to limit data download and include in comparison. Leave blank to use entire state."
-
-        p7 = arcpy.Parameter(
             displayName="Compare to County",
             name="compare_county",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input",
             category="Comparison Geographies")
-        p7.value = True
-        p7.description = "Include county-level comparison in report."
+        p5.value = True
+        p5.description = "Include county-level comparison in report."
 
-        p8 = arcpy.Parameter(
+        p6 = arcpy.Parameter(
+            displayName="County for Comparison",
+            name="county",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+            category="Comparison Geographies")
+        p6.filter.type = "ValueList"
+        p6.filter.list = ["(Select study area first)"]
+        p6.enabled = True
+        p6.description = "Select a county to include in comparison. Auto-populated based on study area location."
+
+        p7 = arcpy.Parameter(
             displayName="Compare to State",
             name="compare_state",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input",
             category="Comparison Geographies")
-        p8.value = True
-        p8.description = "Include state-level comparison in report."
+        p7.value = True
+        p7.description = "Include state-level comparison in report."
 
-        p9 = arcpy.Parameter(
+        p8 = arcpy.Parameter(
             displayName="Compare to Nation",
             name="compare_nation",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input",
             category="Comparison Geographies")
-        p9.value = True
-        p9.description = "Include national-level comparison in report."
+        p8.value = True
+        p8.description = "Include national-level comparison in report."
 
-        p10 = arcpy.Parameter(
+        p9 = arcpy.Parameter(
             displayName="Study Area Name",
             name="study_area_name",
             datatype="GPString",
             parameterType="Optional",
             direction="Input")
-        p10.value = "Study Area"
-        p10.description = "Name to use for the study area in the report."
+        p9.value = "Study Area"
+        p9.description = "Name to use for the study area in the report."
 
-        p11 = arcpy.Parameter(
+        p10 = arcpy.Parameter(
             displayName="Output Report",
             name="output_file",
             datatype="DEFile",
             parameterType="Required",
             direction="Output")
-        p11.filter.list = ["xlsx", "csv", "html"]
-        p11.description = "Output report file. Supports Excel (.xlsx), CSV (.csv), or HTML (.html)."
+        p10.filter.list = ["xlsx", "csv", "html"]
+        p10.description = "Output report file. Supports Excel (.xlsx), CSV (.csv), or HTML (.html)."
 
-        return [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11]
+        return [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10]
 
     def isLicensed(self):
         return True
 
     def updateParameters(self, parameters):
-        # Enable/disable county comparison based on whether county is specified
+        study_area_param = parameters[0]
+        compare_county = parameters[5]
         county_param = parameters[6]
-        compare_county = parameters[7]
-        
-        if not county_param.valueAsText:
-            compare_county.value = False
-            compare_county.enabled = False
-        else:
-            compare_county.enabled = True
+
+        # Detect counties when study area changes
+        if study_area_param.altered and not study_area_param.hasBeenValidated:
+            if study_area_param.value:
+                try:
+                    counties = self._detect_counties(study_area_param.valueAsText)
+                    if counties:
+                        # Format county names with state abbreviation
+                        county_list = []
+                        for c in counties:
+                            state_abbrev = self._fips_to_state_abbrev(c["state_fips"])
+                            county_list.append(f"{c['name']} ({state_abbrev})")
+                        county_param.filter.list = sorted(county_list)
+                        # Auto-select the first county if only one
+                        if len(county_list) == 1:
+                            county_param.value = county_list[0]
+                    else:
+                        county_param.filter.list = ["(No counties detected in study area)"]
+                        county_param.value = None
+                except Exception as e:
+                    county_param.filter.list = [f"(Error: {str(e)[:50]})"]
+            else:
+                county_param.filter.list = ["(Select study area first)"]
+                county_param.value = None
+
+        # Enable/disable county dropdown based on compare to county checkbox
+        county_param.enabled = compare_county.value if compare_county.value else False
 
     def updateMessages(self, parameters):
         study_area = parameters[0]
         indicators = parameters[1]
-        compare_county = parameters[7]
-        compare_state = parameters[8]
-        compare_nation = parameters[9]
+        compare_county = parameters[5]
         county_param = parameters[6]
+        compare_state = parameters[7]
+        compare_nation = parameters[8]
 
         # Check that at least one comparison geography is selected
         if not compare_county.value and not compare_state.value and not compare_nation.value:
             compare_state.setWarningMessage("Select at least one comparison geography for a meaningful report.")
 
-        # Warn about county requirement
-        if compare_county.value and not county_param.valueAsText:
-            compare_county.setErrorMessage("Specify a county name to enable county comparison.")
+        # Warn about county requirement - only if checkbox is checked and no valid county selected
+        if compare_county.value:
+            county_val = county_param.valueAsText
+            if not county_val or county_val.startswith("("):
+                compare_county.setWarningMessage("Select a county for comparison, or uncheck to skip county comparison.")
 
     def execute(self, parameters, messages):
         import time
-        
+
         study_area_layer = parameters[0].valueAsText
         selected_indicators = parameters[1].values
         geography = parameters[2].valueAsText
         year = parameters[3].value
         survey = parameters[4].valueAsText
-        state = parameters[5].valueAsText
-        county = parameters[6].valueAsText
-        compare_county = parameters[7].value
-        compare_state = parameters[8].value
-        compare_nation = parameters[9].value
-        study_area_name = parameters[10].valueAsText or "Study Area"
-        output_file = parameters[11].valueAsText
+        compare_county = parameters[5].value              # Checkbox: compare to county
+        comparison_county = parameters[6].valueAsText     # Selected county for comparison
+        compare_state = parameters[7].value
+        compare_nation = parameters[8].value
+        study_area_name = parameters[9].valueAsText or "Study Area"
+        output_file = parameters[10].valueAsText
 
         arcpy.AddMessage("=" * 60)
         arcpy.AddMessage("Demographic Profile Report")
@@ -2603,20 +3406,15 @@ class DemographicProfileReport(object):
         arcpy.AddMessage(f"  Indicators: {len(selected_indicators)} selected")
         arcpy.AddMessage(f"  Census Geography: {geography}")
         arcpy.AddMessage(f"  Year/Survey: {year} {survey}")
-        arcpy.AddMessage(f"  State: {state}")
-        if county:
-            arcpy.AddMessage(f"  County: {county}")
-        arcpy.AddMessage(f"  Output: {output_file}")
-        arcpy.AddMessage("=" * 60)
 
         # Check for selection
         desc = arcpy.Describe(study_area_layer)
         if hasattr(desc, "FIDSet") and desc.FIDSet:
             selected_count = len(desc.FIDSet.split(";"))
-            arcpy.AddMessage(f"Using {selected_count} selected features")
+            arcpy.AddMessage(f"  Features: {selected_count} selected features")
         else:
             result = arcpy.management.GetCount(study_area_layer)
-            arcpy.AddMessage(f"No selection - using all {result[0]} features")
+            arcpy.AddMessage(f"  Features: all {result[0]} features")
 
         # Create temp directory
         temp_dir = tempfile.mkdtemp(prefix="acs_profile_")
@@ -2625,6 +3423,53 @@ class DemographicProfileReport(object):
         arcpy.AddMessage("Dissolving study area...")
         dissolved_fc = os.path.join(temp_dir, "dissolved.shp")
         arcpy.management.Dissolve(study_area_layer, dissolved_fc)
+
+        # Detect counties that overlap study area
+        arcpy.AddMessage("Detecting geographic coverage...")
+        counties = self._detect_counties(study_area_layer)
+
+        if not counties:
+            arcpy.AddError("Could not detect counties for study area. Ensure the county boundary cache exists.")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+
+        # Get unique states and format county info
+        states = list(set([self._fips_to_state_abbrev(c["state_fips"]) for c in counties]))
+        state_str = ",".join(states)
+
+        # Build county FIPS list for all detected counties
+        county_fips_list = [f"{c['state_fips']}{c['county_fips']}" for c in counties]
+        county_fips_str = ",".join(county_fips_list)
+
+        arcpy.AddMessage(f"  State(s): {state_str}")
+        arcpy.AddMessage(f"  Counties detected: {len(counties)}")
+        for c in counties:
+            state_abbrev = self._fips_to_state_abbrev(c["state_fips"])
+            arcpy.AddMessage(f"    - {c['name']} ({state_abbrev})")
+
+        # Parse comparison county selection (format: "County Name (ST)")
+        comparison_county_name = ""
+        comparison_county_fips = ""
+        comparison_state = ""
+        # Only parse if compare_county is checked and comparison_county is a valid selection (not a placeholder)
+        if comparison_county and compare_county and not comparison_county.startswith("("):
+            # Extract county name and state from selection
+            import re
+            match = re.match(r"(.+)\s+\((\w+)\)$", comparison_county)
+            if match:
+                comparison_county_name = match.group(1)
+                comparison_state = match.group(2)
+                # Find the FIPS code
+                for c in counties:
+                    if c["name"] == comparison_county_name and self._fips_to_state_abbrev(c["state_fips"]) == comparison_state:
+                        comparison_county_fips = c["county_fips"]
+                        break
+                arcpy.AddMessage(f"  Compare to County: {comparison_county_name}, {comparison_state}")
+        elif compare_county:
+            arcpy.AddWarning("No valid county selected for comparison - skipping county comparison")
+
+        arcpy.AddMessage(f"  Output: {output_file}")
+        arcpy.AddMessage("=" * 60)
 
         # Export dissolved area for R
         study_area_shp = os.path.join(temp_dir, "study_area.shp")
@@ -2659,7 +3504,12 @@ class DemographicProfileReport(object):
 
         # Build command
         variables_str = ",".join(all_variables)
-        
+
+        # Format comparison county info for R script
+        # Pass: state abbreviation and county FIPS (3 digits)
+        compare_county_state = comparison_state if comparison_state else ""
+        compare_county_fips = comparison_county_fips if comparison_county_fips else ""
+
         cmd = [
             rscript, script_path,
             study_area_shp.replace("\\", "/"),
@@ -2667,14 +3517,16 @@ class DemographicProfileReport(object):
             survey,
             variables_str,
             geography,
-            state,
-            county or "",
+            state_str,                          # All detected states (comma-separated)
+            county_fips_str,                    # All detected county FIPS codes (5-digit, comma-separated)
             str(compare_county).upper(),
             str(compare_state).upper(),
             str(compare_nation).upper(),
             study_area_name,
             config_file.replace("\\", "/"),
-            output_file.replace("\\", "/")
+            output_file.replace("\\", "/"),
+            compare_county_state,               # State abbrev for comparison county
+            compare_county_fips                 # County FIPS (3-digit) for comparison county
         ]
 
         # Run R script
