@@ -16,6 +16,27 @@ import tempfile
 import shutil
 
 
+# =============================================================================
+# CENSUS DATA CONFIGURATION
+# Update these lists when new Census data becomes available
+# =============================================================================
+ACS5_YEARS = ["2024", "2023", "2022", "2021", "2020", "2019", "2018", "2017", "2016", "2015"]
+ACS1_YEARS = ["2024", "2023", "2022", "2021", "2019", "2018", "2017"]  # No 2020 due to COVID
+
+# ACS 5-Year: All geographies available
+ACS5_GEOGRAPHIES = [
+    "state", "county", "tract", "block group", "place", "zcta",
+    "congressional district", "state legislative district (upper chamber)",
+    "state legislative district (lower chamber)", "county subdivision",
+    "school district (unified)"]
+
+# ACS 1-Year: Only areas with 65,000+ population (no tract, block group, zcta, etc.)
+ACS1_GEOGRAPHIES = [
+    "state", "county", "place", "congressional district",
+    "metropolitan statistical area/micropolitan statistical area"]
+# =============================================================================
+
+
 class Toolbox(object):
     def __init__(self):
         self.label = "Census Studio"
@@ -65,14 +86,14 @@ class DownloadACSDataR(object):
         p0 = arcpy.Parameter(
             displayName="Year",
             name="year",
-            datatype="GPLong",
+            datatype="GPString",
             parameterType="Required",
             direction="Input",
             category="Connection")
-        p0.value = 2023
-        p0.filter.type = "Range"
-        p0.filter.list = [2005, 2040]  # Allow wide range for future years
-        p0.description = "The ACS data year to download. ACS 5-Year available from 2009, ACS 1-Year from 2005."
+        p0.filter.type = "ValueList"
+        p0.filter.list = ACS5_YEARS  # Default to acs5 years
+        p0.value = "2024"
+        p0.description = "The ACS data year to download."
 
         p1 = arcpy.Parameter(
             displayName="Survey",
@@ -147,11 +168,7 @@ class DownloadACSDataR(object):
             direction="Input",
             category="Geography")
         p7.filter.type = "ValueList"
-        p7.filter.list = [
-            "state", "county", "tract", "block group", "place", "zcta",
-            "congressional district", "state legislative district (upper chamber)",
-            "state legislative district (lower chamber)", "county subdivision",
-            "school district (unified)"]
+        p7.filter.list = ACS5_GEOGRAPHIES  # Default to acs5 geographies
         p7.value = "tract"
         p7.description = "The geographic level for the data. Smaller geographies (tract, block group) provide more detail but larger datasets."
 
@@ -241,8 +258,24 @@ class DownloadACSDataR(object):
         county_param = parameters[9]
         zcta_param = parameters[10]
 
+        # Update year and geography lists when survey changes
+        if survey_param.altered and not survey_param.hasBeenValidated:
+            survey = survey_param.valueAsText
+            if survey == "acs1":
+                year_param.filter.list = ACS1_YEARS
+                geo_level_param.filter.list = ACS1_GEOGRAPHIES
+            else:
+                year_param.filter.list = ACS5_YEARS
+                geo_level_param.filter.list = ACS5_GEOGRAPHIES
+            # Reset year to most recent if current selection not in new list
+            if year_param.valueAsText not in year_param.filter.list:
+                year_param.value = year_param.filter.list[0]
+            # Reset geography if current selection not valid for new survey
+            if geo_level_param.valueAsText not in geo_level_param.filter.list:
+                geo_level_param.value = geo_level_param.filter.list[0]
+
         # Get current year and survey
-        year = year_param.value
+        year = year_param.valueAsText  # Now a string
         survey = survey_param.valueAsText
 
         # Load lookup based on year/survey
@@ -370,6 +403,15 @@ class DownloadACSDataR(object):
                 parameters[2].setWarningMessage(
                     f"No variable lookup file for {year} {survey}. Variable browser unavailable, but manual entry will work.")
 
+        # --- ACS 1-Year Geography Limitation ---
+        # ACS 1-Year only available for areas with 65,000+ population
+        acs1_restricted_geos = ["tract", "block group", "county subdivision"]
+        if survey == "acs1" and geo_level in acs1_restricted_geos:
+            geo_level_param.setErrorMessage(
+                f"'{geo_level}' is not available for ACS 1-Year data. "
+                f"ACS 1-Year only covers areas with 65,000+ population. "
+                f"Use ACS 5-Year (acs5) for {geo_level}-level data.")
+
         # --- Geography Validation ---
         state_values = state_param.values or []
         multiple_states = len(state_values) > 1
@@ -444,7 +486,7 @@ class DownloadACSDataR(object):
             state_str,                              # state (comma-separated)
             county_str,                             # county FIPS codes (comma-separated)
             to_r_str(parameters[10].valueAsText),  # zcta
-            to_r_str(parameters[0].value),         # year
+            to_r_str(parameters[0].valueAsText),   # year
             to_r_str(parameters[1].valueAsText),   # survey
             "TRUE",                                 # geometry (hardcoded)
             to_r_bool(parameters[13].value, "FALSE"), # keep_geo_vars
@@ -578,6 +620,7 @@ class DownloadACSDataR(object):
 
 
 class JoinACSData(object):
+
     def __init__(self):
         self.label = "Join ACS Data to Features"
         self.description = "Join ACS Census data to existing polygon features using spatial interpolation"
@@ -629,13 +672,13 @@ class JoinACSData(object):
         p1 = arcpy.Parameter(
             displayName="Year",
             name="year",
-            datatype="GPLong",
+            datatype="GPString",
             parameterType="Required",
             direction="Input",
             category="Census Data")
-        p1.value = 2023
-        p1.filter.type = "Range"
-        p1.filter.list = [2005, 2040]
+        p1.filter.type = "ValueList"
+        p1.filter.list = ACS5_YEARS
+        p1.value = "2024"
         p1.description = "The ACS data year."
 
         p2 = arcpy.Parameter(
@@ -749,8 +792,24 @@ class JoinACSData(object):
         cat_param = parameters[3]
         tbl_param = parameters[4]
         var_param = parameters[5]
+        geo_param = parameters[7]
 
-        year = year_param.value
+        # Update year and geography lists when survey changes
+        if survey_param.altered and not survey_param.hasBeenValidated:
+            survey = survey_param.valueAsText
+            if survey == "acs1":
+                year_param.filter.list = ACS1_YEARS
+                # ACS 1-Year only supports county for spatial joins (no tract, block group, zcta)
+                geo_param.filter.list = ["county"]
+            else:
+                year_param.filter.list = ACS5_YEARS
+                geo_param.filter.list = ["tract", "block group", "county", "zcta"]
+            if year_param.valueAsText not in year_param.filter.list:
+                year_param.value = year_param.filter.list[0]
+            if geo_param.valueAsText not in geo_param.filter.list:
+                geo_param.value = geo_param.filter.list[0]
+
+        year = year_param.valueAsText
         survey = survey_param.valueAsText
         lookup = self._load_lookup(year, survey)
 
@@ -798,7 +857,7 @@ class JoinACSData(object):
         var_param = parameters[5]
         manual_var_param = parameters[6]
 
-        year = year_param.value
+        year = year_param.valueAsText
         survey = survey_param.valueAsText
 
         # Check input is polygon
@@ -827,7 +886,7 @@ class JoinACSData(object):
             return
 
         input_fc = parameters[0].valueAsText
-        year = parameters[1].value
+        year = parameters[1].valueAsText
         survey = parameters[2].valueAsText
 
         # Get variables
@@ -1407,6 +1466,7 @@ class DownloadDecennialCensus(object):
 
 
 class CompareTimePeriods(object):
+
     def __init__(self):
         self.label = "Compare Time Periods"
         self.description = "Compare a single ACS variable across two time periods with statistical significance testing"
@@ -1448,25 +1508,25 @@ class CompareTimePeriods(object):
         p0 = arcpy.Parameter(
             displayName="Year 1 (Earlier)",
             name="year1",
-            datatype="GPLong",
+            datatype="GPString",
             parameterType="Required",
             direction="Input",
             category="Connection")
-        p0.value = 2018
-        p0.filter.type = "Range"
-        p0.filter.list = [2005, 2040]
+        p0.filter.type = "ValueList"
+        p0.filter.list = ACS5_YEARS
+        p0.value = "2018"
         p0.description = "The earlier year for comparison."
 
         p1 = arcpy.Parameter(
             displayName="Year 2 (Later)",
             name="year2",
-            datatype="GPLong",
+            datatype="GPString",
             parameterType="Required",
             direction="Input",
             category="Connection")
-        p1.value = 2023
-        p1.filter.type = "Range"
-        p1.filter.list = [2005, 2040]
+        p1.filter.type = "ValueList"
+        p1.filter.list = ACS5_YEARS
+        p1.value = "2024"
         p1.description = "The later year for comparison."
 
         p2 = arcpy.Parameter(
@@ -1543,11 +1603,7 @@ class CompareTimePeriods(object):
             direction="Input",
             category="Geography")
         p8.filter.type = "ValueList"
-        p8.filter.list = [
-            "state", "county", "tract", "block group", "place", "zcta",
-            "congressional district", "state legislative district (upper chamber)",
-            "state legislative district (lower chamber)", "county subdivision",
-            "school district (unified)"]
+        p8.filter.list = ACS5_GEOGRAPHIES  # Default to acs5 geographies
         p8.value = "tract"
         p8.description = "The geographic level for comparison. Cross-decade comparisons for tract and block group will use population-weighted interpolation."
 
@@ -1605,15 +1661,35 @@ class CompareTimePeriods(object):
         return True
 
     def updateParameters(self, parameters):
+        year1_param = parameters[0]
         year2_param = parameters[1]
         survey_param = parameters[2]
         cat_param = parameters[3]
         tbl_param = parameters[4]
         var_param = parameters[5]
+        geo_param = parameters[8]
         state_param = parameters[9]
         county_param = parameters[10]
 
-        year = year2_param.value
+        # Update year and geography lists when survey changes
+        if survey_param.altered and not survey_param.hasBeenValidated:
+            survey = survey_param.valueAsText
+            if survey == "acs1":
+                year1_param.filter.list = ACS1_YEARS
+                year2_param.filter.list = ACS1_YEARS
+                geo_param.filter.list = ACS1_GEOGRAPHIES
+            else:
+                year1_param.filter.list = ACS5_YEARS
+                year2_param.filter.list = ACS5_YEARS
+                geo_param.filter.list = ACS5_GEOGRAPHIES
+            if year1_param.valueAsText not in year1_param.filter.list:
+                year1_param.value = year1_param.filter.list[-1]  # Earlier year
+            if year2_param.valueAsText not in year2_param.filter.list:
+                year2_param.value = year2_param.filter.list[0]   # Later year
+            if geo_param.valueAsText not in geo_param.filter.list:
+                geo_param.value = geo_param.filter.list[0]
+
+        year = year2_param.valueAsText
         survey = survey_param.valueAsText
         lookup = self._load_lookup(year, survey)
 
@@ -1671,8 +1747,10 @@ class CompareTimePeriods(object):
         state_param = parameters[9]
         geo_param = parameters[8]
 
-        year1 = year1_param.value
-        year2 = year2_param.value
+        year1_str = year1_param.valueAsText
+        year2_str = year2_param.valueAsText
+        year1 = int(year1_str) if year1_str else None
+        year2 = int(year2_str) if year2_str else None
         survey = survey_param.valueAsText
 
         if year1 and year2 and year1 >= year2:
@@ -1684,12 +1762,17 @@ class CompareTimePeriods(object):
                     f"ACS 5-Year estimates require at least 5 years between comparisons to avoid data overlap. "
                     f"Selected years are only {year2 - year1} years apart.")
 
+        if survey == "acs1" and year1 and year2:
+            if year2 - year1 < 1:
+                year1_param.setErrorMessage(
+                    f"Years must be at least 1 year apart for comparison.")
+
         if not var_param.value and not manual_var_param.value:
             var_param.setErrorMessage("Select a variable or enter a variable code manually")
 
-        if not self._load_lookup(year2, survey):
+        if not self._load_lookup(year2_str, survey):
             parameters[3].setErrorMessage(
-                f"No variable lookup file for {year2} {survey}. Run 'Generate Variable Lookup File'.")
+                f"No variable lookup file for {year2_str} {survey}. Run 'Generate Variable Lookup File'.")
 
         if not state_param.value and geo_param.valueAsText not in ["state", "zcta"]:
             state_param.setErrorMessage("State is required for this geography level")
@@ -1708,8 +1791,8 @@ class CompareTimePeriods(object):
             arcpy.AddError(f"R script not found: {script_path}")
             return
 
-        year1 = parameters[0].value
-        year2 = parameters[1].value
+        year1 = parameters[0].valueAsText
+        year2 = parameters[1].valueAsText
         survey = parameters[2].valueAsText
 
         var_sel = parameters[5].valueAsText
@@ -2942,6 +3025,7 @@ class GenerateVariableLookup(object):
             arcpy.AddError(f"R script failed with code {process.returncode}")
 
 class DemographicProfileReport(object):
+
     def __init__(self):
         self.label = "Demographic Profile Report"
         self.description = "Generate a demographic profile comparing a study area to county, state, and national averages"
@@ -3250,12 +3334,12 @@ class DemographicProfileReport(object):
         p3 = arcpy.Parameter(
             displayName="Year",
             name="year",
-            datatype="GPLong",
+            datatype="GPString",
             parameterType="Required",
             direction="Input")
-        p3.value = 2023
-        p3.filter.type = "Range"
-        p3.filter.list = [2009, 2040]
+        p3.filter.type = "ValueList"
+        p3.filter.list = ACS5_YEARS
+        p3.value = "2024"
         p3.description = "ACS data year."
 
         p4 = arcpy.Parameter(
@@ -3265,9 +3349,9 @@ class DemographicProfileReport(object):
             parameterType="Required",
             direction="Input")
         p4.filter.type = "ValueList"
-        p4.filter.list = ["acs5", "acs1"]
+        p4.filter.list = ["acs5"]  # Only acs5 - this tool requires tract/block group which acs1 doesn't support
         p4.value = "acs5"
-        p4.description = "ACS 5-Year (all geographies) or 1-Year (areas 65,000+ population only)."
+        p4.description = "ACS 5-Year estimates (required for tract/block group level data)."
 
         p5 = arcpy.Parameter(
             displayName="Compare to County",
@@ -3336,8 +3420,20 @@ class DemographicProfileReport(object):
 
     def updateParameters(self, parameters):
         study_area_param = parameters[0]
+        year_param = parameters[3]
+        survey_param = parameters[4]
         compare_county = parameters[5]
         county_param = parameters[6]
+
+        # Update year list when survey changes
+        if survey_param.altered and not survey_param.hasBeenValidated:
+            survey = survey_param.valueAsText
+            if survey == "acs1":
+                year_param.filter.list = ACS1_YEARS
+            else:
+                year_param.filter.list = ACS5_YEARS
+            if year_param.valueAsText not in year_param.filter.list:
+                year_param.value = year_param.filter.list[0]
 
         # Detect counties when study area changes
         if study_area_param.altered and not study_area_param.hasBeenValidated:
@@ -3390,7 +3486,7 @@ class DemographicProfileReport(object):
         study_area_layer = parameters[0].valueAsText
         selected_indicators = parameters[1].values
         geography = parameters[2].valueAsText
-        year = parameters[3].value
+        year = parameters[3].valueAsText
         survey = parameters[4].valueAsText
         compare_county = parameters[5].value              # Checkbox: compare to county
         comparison_county = parameters[6].valueAsText     # Selected county for comparison
@@ -3566,6 +3662,7 @@ class DemographicProfileReport(object):
             pass
 
 class HotSpotAnalysis(object):
+
     def __init__(self):
         self.label = "Hot Spot Analysis"
         self.description = "Identify statistically significant hot spots and cold spots using Getis-Ord Gi* with optional MOE adjustment"
